@@ -1,0 +1,74 @@
+# CronJob sync-rg-tags — sincroniza tags FINOPS-CLIENTE dos Resource Groups
+#
+# Roda SOMENTE em aks-prd-newkmm (cluster central do pipeline principal).
+# A identity id-mg-kmm-finops-aks-prd-newkmm-eus-prd precisa de permissão
+# adicional de Reader nas subscriptions listadas em SYNC_SUBSCRIPTION_IDS:
+#
+#   az role assignment create \
+#     --assignee <OBJECT_ID_DA_IDENTITY> \
+#     --role Reader \
+#     --scope /subscriptions/<SUB_ID>
+#
+# Substituir antes de aplicar:
+#   SYNC_SUBSCRIPTION_IDS → lista de IDs separados por vírgula
+#
+# Aplicar:
+#   kubectl apply -f k8s/cronjob-sync-rg-tags.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: finops-sync-rg-tags-config
+  namespace: finops
+data:
+  PIPELINE_STORAGE_ACCOUNT: "stpslkmmfinopseusprd"
+  PIPELINE_CONTAINER: "finops-v2"
+  REFERENCE_PREFIX: "config/reference"
+  # Subscriptions a varrer — separadas por vírgula.
+  # Incluir todas as subscriptions que aparecem no FOCUS Report.
+  SYNC_SUBSCRIPTION_IDS: "52d4423b-7ed9-4673-b8e2-fa21cdb83176,3f6d197f-f70b-4c2c-b981-8bb575d47a7a"
+  LOG_LEVEL: "INFO"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: finops-sync-rg-tags
+  namespace: finops
+spec:
+  schedule: "0 4 * * *"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            azure.workload.identity/use: "true"
+            app: finops-sync-rg-tags
+        spec:
+          serviceAccountName: finops-workload-identity-sa
+          restartPolicy: Never
+          containers:
+            - name: finops-sync-rg-tags
+              image: registrykmm.azurecr.io/finops-pipeline:latest
+              imagePullPolicy: Always
+              command: ["python", "-m", "jobs.run_sync_rg_tags"]
+              envFrom:
+                - configMapRef:
+                    name: finops-sync-rg-tags-config
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: 1000
+                capabilities:
+                  drop: ["ALL"]

@@ -1,0 +1,93 @@
+# CronJob AKS — alocação via OpenCost
+# Aplicar individualmente em cada cluster compartilhado (kubectl apply -f ...)
+# Antes de aplicar em cada cluster, editar:
+#   - azure.workload.identity/client-id  (linha da ServiceAccount) → CLIENT_ID do cluster
+#   - CLUSTER_NAME no ConfigMap          → nome do cluster
+#
+# Cluster                         | RG              | Identity                          | CLIENT_ID
+# aks-hml-newkmm          ✅ DONE | (confirmar)     | id-mg-kmm-finops-aks-newkmm-eus-hml | 5eed8b89-7707-44cf-85e3-a6f86866a25f
+# aks-prd-newkmm                  | RG-US-PRD-KMM   | finops-aks-identity-prd-newkmm    | <preencher>
+# aks-prd-br-newkmm               | RG-PRD-KMM      | finops-aks-identity-prd-br        | <preencher>
+# aks-mg-kmm-firewall-eus-prd     | RG-US-PRD-KMM   | finops-aks-identity-firewall-prd  | <preencher>
+# aks-mg-kmm-firewall-eus-hml     | RG-DEV-KMM      | finops-aks-identity-firewall-hml  | <preencher>
+#
+# Mudar CLUSTER_NAME para o nome do cluster onde o manifest será aplicado.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: finops
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: finops-workload-identity-sa
+  namespace: finops
+  annotations:
+    azure.workload.identity/client-id: "5eed8b89-7707-44cf-85e3-a6f86866a25f"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: finops-aks-config
+  namespace: finops
+data:
+  FOCUS_STORAGE_ACCOUNT: "azurecostexportfocus10"
+  FOCUS_CONTAINER: "azurecostexportfocus10"
+  FOCUS_PREFIX: "costexport/azure-cost-export-focus10-52548376"
+  PIPELINE_STORAGE_ACCOUNT: "stpslkmmfinopseusprd"
+  PIPELINE_CONTAINER: "finops-v2"
+  REFERENCE_PREFIX: "config/reference"
+  AKS_OUT_PREFIX: "gold/aks_allocation_share_opencost"
+  OPENCOST_ENDPOINT: "http://opencost.opencost.svc:9003"
+  OPENCOST_TIMEOUT_SEC: "60"
+  OPENCOST_RETRY_COUNT: "2"
+  OPENCOST_RETRY_DELAY_SEC: "5"
+  PIPELINE_DATE: ""
+  LOG_LEVEL: "INFO"
+  # Alterar para o nome do cluster onde este manifest é aplicado:
+  CLUSTER_NAME: "aks-hml-newkmm"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: finops-aks-allocation
+  namespace: finops
+spec:
+  schedule: "0 5 * * *"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            azure.workload.identity/use: "true"
+            app: finops-aks-allocation
+        spec:
+          serviceAccountName: finops-workload-identity-sa
+          restartPolicy: Never
+          containers:
+            - name: finops-aks
+              image: registrykmm.azurecr.io/finops-pipeline:latest
+              imagePullPolicy: Always
+              command: ["python", "-m", "jobs.run_aks"]
+              envFrom:
+                - configMapRef:
+                    name: finops-aks-config
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: 1000
+                capabilities:
+                  drop: ["ALL"]

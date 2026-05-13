@@ -1,0 +1,85 @@
+# CronJob pipeline principal — s01 → s02 → s03a → s03c → s04 → s05 → s06
+#
+# Roda SOMENTE em aks-prd-newkmm (cluster central do pipeline).
+# Reutiliza o ServiceAccount finops-workload-identity-sa já criado por cronjob-aks.yaml.
+#
+# A identity id-mg-kmm-finops-aks-prd-newkmm-eus-prd precisa de permissões adicionais:
+#   - Storage Blob Data Reader  em azurecostexportfocus10  (sub 0535039d) ← pendente
+#   - Storage Blob Data Contributor em stpslkmmfinopseusprd/finops-v2     ← já atribuído
+#
+# Pré-requisito: cronjob-aks.yaml aplicado em aks-prd-newkmm (cria o ServiceAccount).
+#
+# Aplicar em aks-prd-newkmm:
+#   az aks get-credentials --resource-group RG-US-PRD-KMM --name aks-prd-newkmm
+#   kubectl apply -f k8s/cronjob-pipeline.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: finops-pipeline-config
+  namespace: finops
+data:
+  # Storage FOCUS (entrada — somente leitura)
+  FOCUS_STORAGE_ACCOUNT: "azurecostexportfocus10"
+  FOCUS_CONTAINER: "azurecostexportfocus10"
+  FOCUS_PREFIX: "costexport/azure-cost-export-focus10-52548376"
+  # Storage pipeline (saída)
+  PIPELINE_STORAGE_ACCOUNT: "stpslkmmfinopseusprd"
+  PIPELINE_CONTAINER: "finops-v2"
+  # Prefixos internos
+  REFERENCE_PREFIX: "config/reference"
+  FACT_COST_PREFIX: "silver/fact_cost"
+  RESOURCE_TO_SERVICE_PREFIX: "silver/resource_to_service"
+  DEDICATED_OUT_PREFIX: "gold/dedicated_allocation_share"
+  AKS_OUT_PREFIX: "gold/aks_allocation_share_opencost"
+  SQL_POOL_OUT_PREFIX: "gold/sql_pool_allocation_share"
+  CLIENT_WEIGHTS_PREFIX: "silver/client_weights"
+  ALLOCATION_SHARE_FINAL_PREFIX: "gold/allocation_share_final"
+  FACT_ALLOCATED_COST_PREFIX: "gold/fact_allocated_cost"
+  # Pipeline
+  PIPELINE_DATE: ""
+  LOG_LEVEL: "INFO"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: finops-pipeline
+  namespace: finops
+spec:
+  schedule: "0 6 * * *"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            azure.workload.identity/use: "true"
+            app: finops-pipeline
+        spec:
+          serviceAccountName: finops-workload-identity-sa
+          restartPolicy: Never
+          containers:
+            - name: finops-pipeline
+              image: registrykmm.azurecr.io/finops-pipeline:latest
+              imagePullPolicy: Always
+              command: ["python", "-m", "jobs.run_pipeline"]
+              envFrom:
+                - configMapRef:
+                    name: finops-pipeline-config
+              resources:
+                requests:
+                  cpu: "250m"
+                  memory: "512Mi"
+                limits:
+                  cpu: "1000m"
+                  memory: "8Gi"
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: 1000
+                capabilities:
+                  drop: ["ALL"]
