@@ -18,6 +18,7 @@ import logging
 import os
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from finops.storage import pipeline_client
@@ -60,20 +61,27 @@ def _extract_finops_tag(tags_raw) -> Optional[str]:
     key_lower = _TAG_KEY.lower()
     for k, v in tags.items():
         if k.lower() == key_lower and v:
-            return str(v).strip().upper()
+            raw = str(v).strip().upper()
+            if "," in raw:
+                for token in (t.strip() for t in raw.split(",")):
+                    if token and token != _COMPARTILHADO:
+                        return token
+                return _COMPARTILHADO  # todos os tokens eram COMPARTILHADO ou vazios
+            return raw
     return None
 
 
-def _mc_cluster(rg_name: str, cluster_names: list[str]) -> Optional[str]:
-    """Match MC_*_{cluster}_{region} RG name to a known cluster name."""
-    if not rg_name.upper().startswith("MC_"):
-        return None
-    rg_lower = rg_name.lower()
-    # Sort by length descending to prefer more specific matches
+def _mc_cluster_vec(rg_series: pd.Series, cluster_names: list[str]) -> pd.Series:
+    """Vectorized MC_* RG → cluster name. Returns None for non-matching rows."""
+    result = pd.Series([None] * len(rg_series), index=rg_series.index, dtype=object)
+    mc_mask = rg_series.str.upper().str.startswith("MC_", na=False)
+    if not mc_mask.any():
+        return result
+    rg_lower = rg_series.str.lower()
     for cluster in sorted(cluster_names, key=len, reverse=True):
-        if cluster.lower() in rg_lower:
-            return cluster
-    return None
+        found = mc_mask & rg_lower.str.contains(cluster.lower(), regex=False, na=False)
+        result[found & result.isna()] = cluster
+    return result
 
 
 def run(pipeline_date: Optional[str] = None) -> None:
@@ -85,7 +93,8 @@ def run(pipeline_date: Optional[str] = None) -> None:
     df = store.read_parquet(
         f"{_FACT_COST_PREFIX}/{to_partition(date_str)}/fact_cost.parquet"
     )
-    logger.info("📊 fact_cost: %d linhas", len(df))
+    n_input = len(df)
+    logger.info("📊 fact_cost: %d linhas", n_input)
 
     # rg_tags → {RG_UPPER: FINOPS_CLIENTE_UPPER}
     rg_tags_map: dict[str, str] = {}
@@ -115,87 +124,88 @@ def run(pipeline_date: Optional[str] = None) -> None:
     except Exception:
         pass
 
-    rows: list[dict] = []
+    # ── Vetores base ───────────────────────────────────────────────────────
+    rg_upper = df["ResourceGroupName"].fillna("").str.strip().str.upper()
+    rid = df["ResourceId"].fillna("").astype(str)
 
-    for _, r in df.iterrows():
-        rid = str(r.get("ResourceId", "") or "")
-        rg = str(r.get("ResourceGroupName", "") or "")
-        rg_upper = rg.strip().upper()
+    # Tag por recurso (JSON parsing — apply é mais rápido que iterrows)
+    tag_val = df["Tags"].apply(_extract_finops_tag)
 
-        service_key = rid
-        service_type = "unallocated"
-        rule = "UNKNOWN"
-        confidence = 0
-        effective_cliente = ""
-        source = ""
-        notes = ""
+    # Tag do RG (lookup vetorizado por dicionário)
+    rg_tag_cliente = rg_upper.map(rg_tags_map)
 
-        # Rule 1 — tag FINOPS-CLIENTE no recurso
-        tag_val = _extract_finops_tag(r.get("Tags"))
-        if tag_val and tag_val != _COMPARTILHADO:
-            effective_cliente = tag_val
-            service_type = "dedicated"
-            rule = "TAG_RESOURCE"
-            confidence = 100
-            source = "resource_tag"
+    # AKS cluster: override explícito > padrão MC_*
+    rg_override = rg_upper.map(overrides_map)
+    rg_mc = _mc_cluster_vec(df["ResourceGroupName"].fillna(""), shared_clusters)
+    aks_cluster = rg_override.combine_first(rg_mc)
 
-        # Rule 2 — tag no RG, cliente dedicado
-        elif rg_upper in rg_tags_map and rg_tags_map[rg_upper] != _COMPARTILHADO:
-            effective_cliente = rg_tags_map[rg_upper]
-            service_type = "dedicated"
-            rule = "TAG_RG_INHERITED"
-            confidence = 95
-            source = "rg_tag"
+    # ── Condições de prioridade (np.select usa a primeira verdadeira) ──────
+    cond1 = tag_val.notna() & (tag_val != _COMPARTILHADO)
+    cond2 = rg_tag_cliente.notna() & (rg_tag_cliente != _COMPARTILHADO)
+    cond3 = rg_tag_cliente.notna() & (rg_tag_cliente == _COMPARTILHADO)
+    cond4 = aks_cluster.notna()
+    cond5 = rg_upper != ""
+    condlist = [cond1, cond2, cond3, cond4, cond5]
 
-        # Rule 3 — tag no RG = COMPARTILHADO
-        elif rg_upper in rg_tags_map and rg_tags_map[rg_upper] == _COMPARTILHADO:
-            effective_cliente = _COMPARTILHADO
-            service_type = "shared"
-            rule = "TAG_RG_SHARED"
-            confidence = 90
-            source = "rg_tag"
+    # ── Colunas simples via np.select ──────────────────────────────────────
+    rule = np.select(
+        condlist,
+        ["TAG_RESOURCE", "TAG_RG_INHERITED", "TAG_RG_SHARED", "OVERRIDE_RG_AUTO", "RG_INFERRED"],
+        default="UNKNOWN",
+    )
+    service_type = np.select(
+        condlist,
+        ["dedicated", "dedicated", "shared", "aks", "shared"],
+        default="unallocated",
+    )
+    confidence = np.select(condlist, [100, 95, 90, 95, 70], default=0)
+    source = np.select(
+        condlist,
+        ["resource_tag", "rg_tag", "rg_tag", "mc_rg_pattern", "rg_name"],
+        default="",
+    )
 
-        else:
-            # Rule 4 — RG padrão MC_* (node pool de cluster AKS)
-            cluster = overrides_map.get(rg_upper) or _mc_cluster(rg, shared_clusters)
-            if cluster:
-                service_key = f"AKS:{cluster}"
-                service_type = "aks"
-                rule = "OVERRIDE_RG_AUTO"
-                confidence = 95
-                effective_cliente = ""
-                source = "mc_rg_pattern"
-                notes = f"cluster={cluster}"
+    # ── effective_cliente: fonte varia por regra ───────────────────────────
+    effective_cliente = pd.Series(
+        np.select(
+            condlist,
+            [
+                tag_val.fillna("").values,
+                rg_tag_cliente.fillna("").values,
+                np.full(n_input, _COMPARTILHADO),
+                np.full(n_input, ""),
+                np.full(n_input, _COMPARTILHADO),
+            ],
+            default="",
+        ),
+        index=df.index,
+        dtype=str,
+    )
 
-            # Rule 5 — RG existe mas sem tag → compartilhado por inferência
-            elif rg_upper:
-                effective_cliente = _COMPARTILHADO
-                service_type = "shared"
-                rule = "RG_INFERRED"
-                confidence = 70
-                source = "rg_name"
+    # ── service_key e notes: apenas Rule 4 altera o padrão (ResourceId) ───
+    rule4_wins = cond4 & ~cond1 & ~cond2 & ~cond3
+    service_key = rid.where(~rule4_wins, "AKS:" + aks_cluster.fillna(""))
+    notes = pd.Series("", index=df.index, dtype=str).where(
+        ~rule4_wins, "cluster=" + aks_cluster.fillna("")
+    )
 
-            # Rule 6 — sem classificação
-            else:
-                rule = "UNKNOWN"
-                service_type = "unallocated"
+    # ── Monta output ───────────────────────────────────────────────────────
+    df_out = pd.DataFrame({
+        "Date": date_str,
+        "ResourceId": rid,
+        "ResourceType": df["ResourceType"].fillna("").astype(str),
+        "ResourceName": df["ResourceName"].fillna("").astype(str),
+        "ResourceGroupName": df["ResourceGroupName"].fillna("").astype(str),
+        "ServiceKey": service_key,
+        "ServiceType": service_type,
+        "Rule": rule,
+        "Confidence": confidence,
+        "EffectiveFinopsCliente": effective_cliente,
+        "FinopsClienteSource": source,
+        "Notes": notes,
+    })[_OUTPUT_COLUMNS]
 
-        rows.append({
-            "Date": date_str,
-            "ResourceId": rid,
-            "ResourceType": str(r.get("ResourceType", "") or ""),
-            "ResourceName": str(r.get("ResourceName", "") or ""),
-            "ResourceGroupName": rg,
-            "ServiceKey": service_key,
-            "ServiceType": service_type,
-            "Rule": rule,
-            "Confidence": confidence,
-            "EffectiveFinopsCliente": effective_cliente,
-            "FinopsClienteSource": source,
-            "Notes": notes,
-        })
-
-    df_out = pd.DataFrame(rows, columns=_OUTPUT_COLUMNS)
+    assert len(df_out) == n_input, f"Row count mismatch: {len(df_out)} != {n_input}"
 
     logger.info("📋 Regras: %s", df_out["Rule"].value_counts().to_dict())
     logger.info("📋 ServiceTypes: %s", df_out["ServiceType"].value_counts().to_dict())

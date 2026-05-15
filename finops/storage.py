@@ -114,3 +114,22 @@ def pipeline_client() -> StorageClient:
         account=os.environ["PIPELINE_STORAGE_ACCOUNT"],
         container=os.environ["PIPELINE_CONTAINER"],
     )
+
+
+def upload_parquet(
+    df: pd.DataFrame,
+    storage_account: str,
+    container: str,
+    blob_path: str,
+) -> None:
+    """Faz upload de um DataFrame como parquet snappy para o Blob Storage."""
+    svc = _service_client(storage_account)
+
+    def _do():
+        buf = io.BytesIO()
+        df.to_parquet(buf, engine="pyarrow", compression="snappy", index=False)
+        buf.seek(0)
+        svc.get_blob_client(container=container, blob=blob_path).upload_blob(buf, overwrite=True)
+        logger.info("⬆️  %s/%s/%s (%d linhas)", storage_account, container, blob_path, len(df))
+
+    _retry(_do)
