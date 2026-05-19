@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY finops/ ./finops/
 COPY jobs/   ./jobs/
+COPY sh/     ./sh/
 
 RUN useradd -m finops
 USER finops

@@ -1,7 +1,7 @@
 """
 run_pipeline.py — Entrypoint do pipeline principal FinOps.
 
-Executa steps em ordem: s01 → s02 → s03a → s03c → s04 → s05 → s06.
+Executa steps em ordem: s01 → s02 → s03a → s03c → s04 → s05 → s06 → s07.
 Roda às 06:00 UTC em aks-prd-newkmm (cluster central).
 """
 
@@ -19,6 +19,7 @@ from finops.steps import (
     s04_client_weights,
     s05_consolidate,
     s06_fact_allocated_cost,
+    s07_consolidate_pbi,
 )
 
 logging.basicConfig(
@@ -59,6 +60,7 @@ _STEPS = [
     ("s04_client_weights", s04_client_weights.run),
     ("s05_consolidate", s05_consolidate.run),
     ("s06_fact_allocated_cost", s06_fact_allocated_cost.run),
+    ("s07_consolidate_pbi", s07_consolidate_pbi.run),
 ]
 
 

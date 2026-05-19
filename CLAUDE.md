@@ -73,6 +73,9 @@ finops-v2/
   gold/aks_allocation_share_opencost/dt=yyyy-MM-dd/
   gold/allocation_share_final/dt=yyyy-MM-dd/
   gold/fact_allocated_cost/dt=yyyy-MM-dd/
+  gold/fact_allocated_cost_consolidated/
+    fact_allocated_cost_all.parquet  ← histórico completo para Power BI
+    manifest.csv                     ← uma linha por data (Status, Rows, TotalAllocated)
 ```
 
 ### 3. Storage do Pipeline PS atual (não tocar)
@@ -198,7 +201,7 @@ Arquivo: `config/reference/cluster_config.csv`
 ```
 04:00 UTC → s00_sync_rg_tags    (varre RGs das subscriptions → rg_tags.csv)
 05:00 UTC → s03b_aks            (dentro de cada cluster compartilhado)
-06:00 UTC → pipeline principal  (s01 → s02 → s03a → s03c → s04 → s05 → s06)
+06:00 UTC → pipeline principal  (s01 → s02 → s03a → s03c → s04 → s05 → s06 → s07)
 ```
 
 | Step | Arquivo | Descrição |
@@ -211,7 +214,8 @@ Arquivo: `config/reference/cluster_config.csv`
 | s03c | `finops/steps/s03c_sql_pool.py` | SQL Pool via CPU+Disk (ARM API + Azure Monitor) |
 | s04 | `finops/steps/s04_client_weights.py` | Peso por cliente |
 | s05 | `finops/steps/s05_consolidate.py` | Consolida shares, valida soma=1.0 |
-| s06 | `finops/steps/s06_fact_allocated_cost.py` | AllocatedCost = BilledCost × Share |
+| s06 | `finops/steps/s06_fact_allocated_cost.py` | AllocatedCost = BilledCost × Share, 5 outputs |
+| s07 | `finops/steps/s07_consolidate_pbi.py` | Append diário no consolidado Power BI + manifest.csv |
 
 ---
 
@@ -255,6 +259,8 @@ SQL_POOL_OUT_PREFIX=gold/sql_pool_allocation_share
 CLIENT_WEIGHTS_PREFIX=silver/client_weights
 ALLOCATION_SHARE_FINAL_PREFIX=gold/allocation_share_final
 FACT_ALLOCATED_COST_PREFIX=gold/fact_allocated_cost
+PBI_CONSOLIDATED_BLOB=gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet
+PBI_MANIFEST_BLOB=gold/fact_allocated_cost_consolidated/manifest.csv
 
 # OpenCost (usado apenas no job AKS)
 OPENCOST_ENDPOINT=http://opencost.opencost.svc:9003
@@ -299,6 +305,19 @@ Date;ServiceKey;Cliente;Share;DriverType;AllocationMethod
 Date;ResourceId;ServiceKey;Cliente;Cost;Share;AllocatedCost;AllocationMethod
 ```
 
+### fact_allocated_cost_all.parquet (consolidado Power BI)
+Mesmo schema do fact_allocated_cost — todas as datas em um único arquivo.
+Colunas extras incluídas pelo s06: `ResourceName;ResourceGroupName;ResourceType;SubscriptionId;ServiceName;DriverType`
+
+### manifest.csv (consolidado Power BI)
+```
+Date;Status;Rows;TotalAllocated;TotalCost;ProcessedAt;PipelineRun
+```
+- `Status`: `OK` ou `ERROR`
+- `TotalAllocated`: soma de `AllocatedCost` do dia
+- `TotalCost`: soma de `Cost` do dia (custo bruto antes do rateio)
+- `PipelineRun`: valor de `PIPELINE_RUN_ID` no momento do processamento
+
 ---
 
 ## Estado atual — tudo operacional ✅
@@ -316,17 +335,19 @@ Date;ResourceId;ServiceKey;Cliente;Cost;Share;AllocatedCost;AllocationMethod
 - [x] `finops/steps/s04_client_weights.py` — peso por custo dedicado, fallback igualitário
 - [x] `finops/steps/s05_consolidate.py` — consolida s03a+s03b+s03c, distribui restante por client_weights
 - [x] `finops/steps/s06_fact_allocated_cost.py` — AllocatedCost = Cost × Share, 5 outputs por data
+- [x] `finops/steps/s07_consolidate_pbi.py` — append diário idempotente + manifest.csv; validação (linhas + TotalAllocated diff < 1.0); manifest ERROR em falha
 - [x] `jobs/run_aks.py`
 - [x] `jobs/run_sync_rg_tags.py`
-- [x] `jobs/run_pipeline.py`
+- [x] `jobs/run_pipeline.py` — s07 integrado como último step
 - [x] `sh/retro_may.py` — script de retrocarga sequencial por data
+- [x] `sh/build_consolidated.py` — percorre todos os parquets em `gold/fact_allocated_cost/` e chama s07 por data
 - [x] `requirements.txt` — `azure-monitor-query==1.3.0`, `azure-mgmt-sql>=3.0.0`
 
 ### Kubernetes / infra de código
 - [x] `k8s/cronjob-aks.yaml` — um por cluster, CLIENT_ID preenchido
 - [x] `k8s/cronjob-sync-rg-tags.yaml`
 - [x] `k8s/cronjob-pipeline.yaml` — inclui `BILLING_SUBSCRIPTION_IDS` no ConfigMap
-- [x] `Dockerfile`
+- [x] `Dockerfile` — inclui `COPY sh/ ./sh/` para expor build_consolidated.py nos pods
 - [x] `requirements.txt`
 
 ### Configuração / referência
@@ -334,7 +355,7 @@ Date;ResourceId;ServiceKey;Cliente;Cost;Share;AllocatedCost;AllocationMethod
 - [x] `config/reference/clientes_alias.csv`
 
 ### Infraestrutura provisionada
-- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (run `cqm`, 2026-05-19)
+- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (run `cqp`, 2026-05-19; inclui sh/ e s07)
 - [x] Container `finops-v2` criado em `stpslkmmfinopseusprd`
 
 ### Clusters AKS — todos os 5 com OpenCost operacionais ✅
@@ -348,7 +369,7 @@ Date;ResourceId;ServiceKey;Cliente;Cost;Share;AllocatedCost;AllocationMethod
 - Permissões: `Storage Blob Data Contributor` em `finops-v2` + `Reader` em `52d4423b` + `Reader` em `3f6d197f` + `Storage Blob Data Reader` em `azurecostexportfocus10`
 - `finops-sync-rg-tags` CronJob — 04:00 UTC ✅
 - `finops-pipeline` CronJob — 06:00 UTC ✅
-- Retrocarga executada: 2026-05-01 a 2026-05-15 (15/15 OK, 100% alocado)
+- Retrocarga executada: 2026-05-01 a 2026-05-18 (18/18 OK, 100% alocado)
 
 #### aks-prd-br-newkmm (2026-05-04)
 - Identity: `id-mg-kmm-finops-aks-prd-br-newkmm-eus-prd` (CLIENT_ID: `e67c4ddc-1e3f-451b-a9bd-b41296bf2834`)
@@ -385,8 +406,14 @@ Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 - `reconciliation_2026-05-18.csv`
 - `unallocated_cost_2026-05-18.csv`
 
-Retrocarga 2026-05-01 a 2026-05-15: 15/15 datas processadas, todas com 100% de alocação.
+Retrocarga 2026-05-01 a 2026-05-18: 18/18 datas processadas, todas com 100% de alocação.
 Saída em `finops-v2/gold/fact_allocated_cost/dt=<data>/`.
+
+Consolidado Power BI (s07) — validado em 2026-05-19:
+- `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet`: **989 423 linhas**, 18 datas
+- `gold/fact_allocated_cost_consolidated/manifest.csv`: 18 entradas, todas `Status=OK`
+- Linhas no consolidado == soma exata do manifest ✅
+- build_consolidated.py executado via k8s job (`finops-build-consolidated`) com 18/18 OK
 
 ---
 
@@ -403,8 +430,9 @@ Saída em `finops-v2/gold/fact_allocated_cost/dt=<data>/`.
 - [ ] Corrigir tags numéricas (`FINOPS-CLIENTE=267`, `8`, `35`...) no portal Azure
 
 ### Relatórios / Power BI
-- [ ] Power BI — conectar direto no Blob Storage (`finops-v2`) via Azure Storage connector
-- [ ] Criar arquivo consolidado `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet` com todas as datas para facilitar refresh no Power BI (evita leitura de múltiplas partições)
+- [x] Criar arquivo consolidado `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet` com todas as datas — 989 423 linhas, 18 datas (2026-05-01 a 2026-05-18) ✅
+- [x] manifest.csv com status por data (`gold/fact_allocated_cost_consolidated/manifest.csv`) ✅
+- [ ] Power BI — conectar direto no Blob Storage (`finops-v2`) via Azure Storage connector e apontar para o consolidado
 
 ---
 
