@@ -14,6 +14,19 @@ O objetivo central é distribuir o custo Azure entre clientes de forma auditáve
 
 ---
 
+## Escopo de subscriptions
+
+O pipeline processa **apenas** recursos das subscriptions KMM. O FOCUS Report cobre todo o enrollment Azure EA — o filtro é aplicado em `s01_ingest_focus.py` via `BILLING_SUBSCRIPTION_IDS`.
+
+| Subscription | Nome | ID |
+|---|---|---|
+| KMM PRD | Azure EA - KMM - PRD | `52d4423b-7ed9-4673-b8e2-fa21cdb83176` |
+| KMM DEV-TEST | Azure EA - KMM - DEV-TEST | `3f6d197f-f70b-4c2c-b981-8bb575d47a7a` |
+
+**Atenção:** o FOCUS armazena `SubscriptionId` (via `SubAccountId`) no formato ARM completo `/subscriptions/{guid}`. O filtro em s01 normaliza esse valor antes de comparar com os GUIDs da constante.
+
+---
+
 ## Três Storage Accounts — papéis distintos
 
 ### 1. Storage de ENTRADA — FOCUS Report (somente leitura)
@@ -23,7 +36,7 @@ Subscription: 0535039d-8b8e-4ac1-9fce-9f727e8ba2b1  (Azure EA - NSTECH - PRD)
 Container   : azurecostexportfocus10
 Prefixo     : costexport/azure-cost-export-focus10-52548376/
 Estrutura   : costexport/azure-cost-export-focus10-52548376/<yyyyMMdd-yyyyMMdd>/<arquivo>
-Exemplo     : costexport/azure-cost-export-focus10-52548376/20260401-20260430/data.parquet
+Exemplo     : costexport/azure-cost-export-focus10-52548376/20260501-20260531/data.parquet
 ```
 O pipeline **nunca escreve** neste storage.
 Permissão necessária: `Storage Blob Data Reader`
@@ -39,7 +52,7 @@ Lógica de seleção do arquivo (equivalente ao script 02 PS):
 Account     : stpslkmmfinopseusprd
 Subscription: 52d4423b-7ed9-4673-b8e2-fa21cdb83176
 RG          : rg-psl-kmm-finops-eus-prd
-Container   : finops-v2   ← CRIAR ANTES DE RODAR O PIPELINE
+Container   : finops-v2
 ```
 Permissão necessária: `Storage Blob Data Contributor`
 
@@ -70,23 +83,6 @@ Container: finops   ← manter intacto, pipeline PS continua rodando
 
 ---
 
-## Como criar o container finops-v2 no portal
-
-1. Portal Azure → `stpslkmmfinopseusprd` → **Containers** → **+ Container**
-2. Name: `finops-v2`
-3. Public access level: `Private`
-4. **Create**
-
-Ou via terminal:
-```bash
-az storage container create \
-  --account-name stpslkmmfinopseusprd \
-  --name finops-v2 \
-  --auth-mode login
-```
-
----
-
 ## Autenticação — Workload Identity
 
 O cluster `aks-hml-newkmm` (e os demais) já têm OIDC + Workload Identity habilitados.
@@ -101,34 +97,27 @@ Setup necessário — fazer uma vez por cluster compartilhado:
 5. Preencher <CLIENT_ID> no k8s/cronjob-aks.yaml
 ```
 
-Identities necessárias (uma por cluster compartilhado):
+Identidades configuradas:
 
 | Cluster | Identity name | Resource Group | Status |
 |---|---|---|---|
-| aks-prd-newkmm | id-mg-kmm-finops-aks-prd-newkmm-eus-prd | RG-US-PRD-KMM | ⏳ pendente |
-| aks-prd-br-newkmm | id-mg-kmm-finops-aks-prd-br-newkmm-eus-prd | RG-PRD-KMM | ⏳ pendente |
-| aks-hml-newkmm | id-mg-kmm-finops-aks-newkmm-eus-hml | RG-US-PRD-KMM | ✅ configurado |
-| aks-mg-kmm-firewall-eus-prd | id-mg-kmm-finops-aks-firewall-eus-prd | RG-US-PRD-KMM | ⏳ pendente |
-| aks-mg-kmm-firewall-eus-hml | id-mg-kmm-finops-aks-firewall-eus-hml | RG-DEV-KMM (sub: 3f6d197f) | ⏳ pendente |
+| aks-prd-newkmm | id-mg-kmm-finops-aks-prd-newkmm-eus-prd | RG-US-PRD-KMM | ✅ operacional |
+| aks-prd-br-newkmm | id-mg-kmm-finops-aks-prd-br-newkmm-eus-prd | RG-PRD-KMM | ✅ operacional |
+| aks-hml-newkmm | id-mg-kmm-finops-aks-newkmm-eus-hml | RG-US-PRD-KMM | ✅ operacional |
+| aks-mg-kmm-firewall-eus-prd | id-mg-kmm-finops-aks-firewall-eus-prd | RG-US-PRD-KMM | ✅ operacional |
+| aks-mg-kmm-firewall-eus-hml | id-mg-kmm-finops-aks-firewall-eus-hml | RG-DEV-KMM (sub: 3f6d197f) | ✅ operacional |
 
 Comandos para criar e configurar cada identity:
 ```bash
 # 1. Criar identity (repetir para cada cluster)
 az identity create \
-  --name finops-aks-identity-hml \
+  --name <IDENTITY-NAME> \
   --resource-group <RG-DO-CLUSTER> \
   --location eastus
 
 # 2. Pegar Client ID e Object ID
-CLIENT_ID=$(az identity show \
-  --name finops-aks-identity-hml \
-  --resource-group <RG-DO-CLUSTER> \
-  --query clientId -o tsv)
-
-OBJECT_ID=$(az identity show \
-  --name finops-aks-identity-hml \
-  --resource-group <RG-DO-CLUSTER> \
-  --query principalId -o tsv)
+CLIENT_ID=$(az identity show --name <IDENTITY-NAME> --resource-group <RG> --query clientId -o tsv)
+OBJECT_ID=$(az identity show --name <IDENTITY-NAME> --resource-group <RG> --query principalId -o tsv)
 
 # 3. Reader no storage do FOCUS (subscription diferente)
 az role assignment create \
@@ -143,15 +132,11 @@ az role assignment create \
   --scope "/subscriptions/52d4423b-7ed9-4673-b8e2-fa21cdb83176/resourceGroups/rg-psl-kmm-finops-eus-prd/providers/Microsoft.Storage/storageAccounts/stpslkmmfinopseusprd/blobServices/default/containers/finops-v2"
 
 # 5. Federated Credential
-OIDC_ISSUER=$(az aks show \
-  --resource-group <RG-DO-CLUSTER> \
-  --name aks-hml-newkmm \
-  --query "oidcIssuerProfile.issuerUrl" -o tsv)
-
+OIDC_ISSUER=$(az aks show --resource-group <RG> --name <CLUSTER> --query "oidcIssuerProfile.issuerUrl" -o tsv)
 az identity federated-credential create \
-  --name finops-aks-hml-federated \
-  --identity-name finops-aks-identity-hml \
-  --resource-group <RG-DO-CLUSTER> \
+  --name finops-aks-federated \
+  --identity-name <IDENTITY-NAME> \
+  --resource-group <RG> \
   --issuer $OIDC_ISSUER \
   --subject "system:serviceaccount:finops:finops-workload-identity-sa" \
   --audiences "api://AzureADTokenExchange"
@@ -180,6 +165,11 @@ az identity federated-credential create \
 6. Sem classificação
    → UNKNOWN | unallocated
 ```
+
+Override pós-hierarquia (aplicado sobre o resultado das 6 regras acima):
+- `ResourceType = microsoft.sql/servers/elasticpools`
+  → `ServiceKey = SQLPOOL:{pool_name}` | `ServiceType = sql_pool`
+  → Não é capturado por s03a (dedicado) — processado exclusivamente por s03c
 
 ---
 
@@ -214,11 +204,11 @@ Arquivo: `config/reference/cluster_config.csv`
 | Step | Arquivo | Descrição |
 |---|---|---|
 | s00 | `finops/steps/s00_sync_rg_tags.py` | Varre RGs, salva rg_tags.csv |
-| s01 | `finops/steps/s01_ingest_focus.py` | Lê FOCUS parquet → fact_cost |
+| s01 | `finops/steps/s01_ingest_focus.py` | Lê FOCUS parquet → fact_cost, filtra por BILLING_SUBSCRIPTION_IDS |
 | s02 | `finops/steps/s02_classify.py` | Classifica recursos → resource_to_service |
 | s03a | `finops/steps/s03a_dedicated.py` | Recursos dedicados, share=1.0 |
-| s03b | `finops/steps/s03b_aks.py` | AKS via OpenCost (já implementado) |
-| s03c | `finops/steps/s03c_sql_pool.py` | SQL Pool via CPU+Disk |
+| s03b | `finops/steps/s03b_aks.py` | AKS via OpenCost |
+| s03c | `finops/steps/s03c_sql_pool.py` | SQL Pool via CPU+Disk (ARM API + Azure Monitor) |
 | s04 | `finops/steps/s04_client_weights.py` | Peso por cliente |
 | s05 | `finops/steps/s05_consolidate.py` | Consolida shares, valida soma=1.0 |
 | s06 | `finops/steps/s06_fact_allocated_cost.py` | AllocatedCost = BilledCost × Share |
@@ -246,6 +236,9 @@ FOCUS_STORAGE_ACCOUNT=azurecostexportfocus10
 FOCUS_SUBSCRIPTION_ID=0535039d-8b8e-4ac1-9fce-9f727e8ba2b1
 FOCUS_CONTAINER=azurecostexportfocus10
 FOCUS_PREFIX=costexport/azure-cost-export-focus10-52548376
+
+# Subscriptions de faturamento cujos recursos são incluídos no pipeline
+BILLING_SUBSCRIPTION_IDS=52d4423b-7ed9-4673-b8e2-fa21cdb83176,3f6d197f-f70b-4c2c-b981-8bb575d47a7a
 
 # Storage Pipeline (saída)
 PIPELINE_STORAGE_ACCOUNT=stpslkmmfinopseusprd
@@ -308,146 +301,115 @@ Date;ResourceId;ServiceKey;Cliente;Cost;Share;AllocatedCost;AllocationMethod
 
 ---
 
-## O que já foi implementado
+## Estado atual — tudo operacional ✅
 
-### Código Python
-- [x] `finops/utils/dates.py`
+### Código Python — 100% implementado
+- [x] `finops/utils/dates.py` — inclui `brazil_today()` e `parse_usage_date()`
 - [x] `finops/utils/logging.py`
-- [x] `finops/storage.py` — suporta dois storage accounts (FOCUS_* e PIPELINE_*)
+- [x] `finops/storage.py` — dois storage accounts; `download_csv_with_fallback()`, `upload_parquet()`, `upload_csv()`
 - [x] `finops/steps/s00_sync_rg_tags.py`
-- [x] `finops/steps/s01_ingest_focus.py`
-- [x] `finops/steps/s02_classify.py`
-- [x] `finops/steps/s03a_dedicated.py`
-- [x] `finops/steps/s03b_aks.py` — usa variáveis FOCUS_* e PIPELINE_*
-- [x] `finops/steps/s03c_sql_pool.py`
-- [x] `finops/steps/s04_client_weights.py`
-- [x] `finops/steps/s05_consolidate.py`
-- [x] `finops/steps/s06_fact_allocated_cost.py`
+- [x] `finops/steps/s01_ingest_focus.py` — inclui filtro `BILLING_SUBSCRIPTION_IDS` com normalização de prefixo ARM
+- [x] `finops/steps/s02_classify.py` — hierarquia 6 regras, MC_ pattern, Tags JSON, vetorizado com np.select; elastic pools recebem `ServiceKey=SQLPOOL:{pool_name}` e `ServiceType=sql_pool`
+- [x] `finops/steps/s03a_dedicated.py` — Share=1.0 por recurso dedicado
+- [x] `finops/steps/s03b_aks.py` — AKS via OpenCost
+- [x] `finops/steps/s03c_sql_pool.py` — SQL Elastic Pools: ARM API + Monitor CPU; `AllocationMethod` correto; skip gracioso quando não há pools na data; output em `gold/sql_pool_allocation_share`
+- [x] `finops/steps/s04_client_weights.py` — peso por custo dedicado, fallback igualitário
+- [x] `finops/steps/s05_consolidate.py` — consolida s03a+s03b+s03c, distribui restante por client_weights
+- [x] `finops/steps/s06_fact_allocated_cost.py` — AllocatedCost = Cost × Share, 5 outputs por data
 - [x] `jobs/run_aks.py`
 - [x] `jobs/run_sync_rg_tags.py`
 - [x] `jobs/run_pipeline.py`
+- [x] `sh/retro_may.py` — script de retrocarga sequencial por data
+- [x] `requirements.txt` — `azure-monitor-query==1.3.0`, `azure-mgmt-sql>=3.0.0`
 
 ### Kubernetes / infra de código
-- [x] `k8s/cronjob-aks.yaml` — CLIENT_ID e ACR preenchidos para `aks-hml-newkmm`
+- [x] `k8s/cronjob-aks.yaml` — um por cluster, CLIENT_ID preenchido
 - [x] `k8s/cronjob-sync-rg-tags.yaml`
-- [x] `k8s/cronjob-pipeline.yaml`
+- [x] `k8s/cronjob-pipeline.yaml` — inclui `BILLING_SUBSCRIPTION_IDS` no ConfigMap
 - [x] `Dockerfile`
 - [x] `requirements.txt`
 
 ### Configuração / referência
 - [x] `config/reference/cluster_config.csv`
 - [x] `config/reference/clientes_alias.csv`
-- [x] `CLAUDE.md`
 
 ### Infraestrutura provisionada
-- [x] ACR definido: `registrykmm` → `registrykmm.azurecr.io/finops-pipeline:latest`
-- [x] Build da imagem: `az acr build` publicou `registrykmm.azurecr.io/finops-pipeline:latest`
+- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (run `cqm`, 2026-05-19)
 - [x] Container `finops-v2` criado em `stpslkmmfinopseusprd`
-- [x] FOCUS Reader **não é necessário** para o job AKS — `s03b_aks.py` só acessa `finops-v2`
 
-#### aks-hml-newkmm — ✅ 100% operacional (2026-04-30)
-- [x] Identity: `id-mg-kmm-finops-aks-newkmm-eus-hml` (CLIENT_ID: `5eed8b89-7707-44cf-85e3-a6f86866a25f`)
-- [x] `Storage Blob Data Contributor` em `stpslkmmfinopseusprd/finops-v2`
-- [x] Federated Credential criado
-- [x] AcrPull atribuído ao kubelet identity do cluster
-- [x] CronJob aplicado — executa diariamente às 05:00 UTC
+### Clusters AKS — todos os 5 com OpenCost operacionais ✅
 
-#### aks-prd-newkmm — ✅ 100% operacional (2026-04-30)
-- [x] Identity: `id-mg-kmm-finops-aks-prd-newkmm-eus-prd` (CLIENT_ID: `40995235-e00b-417e-83a6-4ca383f9d169`)
-- [x] `Storage Blob Data Contributor` em `stpslkmmfinopseusprd/finops-v2`
-- [x] Federated Credential criado
-- [x] AcrPull atribuído ao kubelet identity
-- [x] CronJob aplicado — 3 execuções bem-sucedidas confirmadas (2026-05-02 a 2026-05-04)
+#### aks-hml-newkmm (2026-04-30)
+- Identity: `id-mg-kmm-finops-aks-newkmm-eus-hml` (CLIENT_ID: `5eed8b89-7707-44cf-85e3-a6f86866a25f`)
+- CronJob AKS aplicado — executa diariamente às 05:00 UTC
 
-#### aks-prd-br-newkmm — ✅ 100% operacional (2026-05-04)
-- [x] Identity: `id-mg-kmm-finops-aks-prd-br-newkmm-eus-prd` (CLIENT_ID: `e67c4ddc-1e3f-451b-a9bd-b41296bf2834`)
-- [x] `Storage Blob Data Contributor` em `stpslkmmfinopseusprd/finops-v2`
-- [x] OIDC Issuer + Workload Identity habilitados via `az aks update`
-- [x] Federated Credential criado
-- [x] AcrPull atribuído ao kubelet identity
-- [x] CronJob aplicado — teste: 5 namespaces → 1 cliente → gravado
+#### aks-prd-newkmm — cluster central (2026-04-30 / atualizado 2026-05-16)
+- Identity: `id-mg-kmm-finops-aks-prd-newkmm-eus-prd` (CLIENT_ID: `40995235-e00b-417e-83a6-4ca383f9d169`)
+- Permissões: `Storage Blob Data Contributor` em `finops-v2` + `Reader` em `52d4423b` + `Reader` em `3f6d197f` + `Storage Blob Data Reader` em `azurecostexportfocus10`
+- `finops-sync-rg-tags` CronJob — 04:00 UTC ✅
+- `finops-pipeline` CronJob — 06:00 UTC ✅
+- Retrocarga executada: 2026-05-01 a 2026-05-15 (15/15 OK, 100% alocado)
 
-#### aks-mg-kmm-firewall-eus-prd — ✅ 100% operacional (2026-05-04)
+#### aks-prd-br-newkmm (2026-05-04)
+- Identity: `id-mg-kmm-finops-aks-prd-br-newkmm-eus-prd` (CLIENT_ID: `e67c4ddc-1e3f-451b-a9bd-b41296bf2834`)
+- CronJob AKS aplicado — executa diariamente às 05:00 UTC
+
+#### aks-mg-kmm-firewall-eus-prd (2026-05-04)
 - Subscription: `52d4423b-7ed9-4673-b8e2-fa21cdb83176` | RG: `RG-US-PRD-KMM`
-- [x] Identity: `id-mg-kmm-finops-aks-firewall-eus-prd` (CLIENT_ID: `23fe2b59-90a1-450d-8531-de76eba5340a`)
-- [x] `Storage Blob Data Contributor` em `stpslkmmfinopseusprd/finops-v2`
-- [x] Federated Credential criado
-- [x] AcrPull atribuído ao kubelet identity
-- [x] CronJob aplicado — teste: 6 namespaces → 1 cliente → gravado
+- Identity: `id-mg-kmm-finops-aks-firewall-eus-prd` (CLIENT_ID: `23fe2b59-90a1-450d-8531-de76eba5340a`)
+- CronJob AKS aplicado — executa diariamente às 05:00 UTC
 
-#### aks-mg-kmm-firewall-eus-hml — ✅ 100% operacional (2026-05-04)
-- Subscription: `3f6d197f-f70b-4c2c-b981-8bb575d47a7a` (Azure EA - KMM - DEV-TEST) | RG: `RG-DEV-KMM`
-- [x] Identity: `id-mg-kmm-finops-aks-firewall-eus-hml` (CLIENT_ID: `bffedfaa-5c53-4409-988c-c6884579cebc`)
-- [x] `Storage Blob Data Contributor` em `stpslkmmfinopseusprd/finops-v2`
-- [x] Federated Credential criado
-- [x] AcrPull atribuído ao kubelet identity
-- [x] CronJob aplicado — teste: 6 namespaces → 1 cliente → gravado
-
-## O que falta — infraestrutura (fazer no portal/terminal antes do código)
-
-### Clusters com OpenCost — todos operacionais ✅
-Os 5 clusters com OpenCost estão configurados e executando diariamente às 05:00 UTC.
-
-### Clusters sem OpenCost (bloquear — instalar OpenCost primeiro)
-- [ ] aks-mg-kmm-dados-eus-prd — instalar OpenCost, depois seguir o fluxo acima
-- [ ] aks-prd-emissor — migrar para OpenCost, depois seguir o fluxo acima
-- [ ] aks-mg-kmm-win-eus-hml — instalar OpenCost, depois seguir o fluxo acima
-
-## O que falta — código Python (implementar nesta ordem)
-
-- [x] `finops/steps/s00_sync_rg_tags.py` + `jobs/run_sync_rg_tags.py` + `k8s/cronjob-sync-rg-tags.yaml`
-- [x] `finops/steps/s01_ingest_focus.py`
-- [x] `finops/steps/s02_classify.py` — hierarquia 6 regras, MC_ pattern, Tags JSON
-- [x] `finops/steps/s03a_dedicated.py` — Share=1.0 por recurso dedicado
-- [x] `finops/steps/s03c_sql_pool.py` — SQL Elastic Pools: lista databases via ARM API, CPU média via Azure Monitor, redistribui não-mapeados proporcionalmente
-- [x] `finops/steps/s04_client_weights.py` — peso por custo dedicado, fallback igualitário
-- [x] `finops/steps/s05_consolidate.py` — consolida s03a+s03b+s03c, distribui restante por client_weights
-- [x] `finops/steps/s06_fact_allocated_cost.py` — AllocatedCost = Cost × Share
-- [x] `jobs/run_pipeline.py` — orquestra s01→s02→s03a→s03c→s04→s05→s06
-- [x] `k8s/cronjob-pipeline.yaml` — 06:00 UTC, aks-prd-newkmm
-
-#### aks-prd-newkmm — jobs centrais ✅ 100% operacional (2026-05-12)
-- [x] `Reader` em `52d4423b` (KMM PRD) — atribuído via REST
-- [x] `Reader` em `3f6d197f` (KMM DEV-TEST) — atribuído via REST
-- [x] `Storage Blob Data Reader` em `azurecostexportfocus10` (sub `0535039d`) — atribuído
-- [x] Rebuild da imagem com `azure-mgmt-resource` publicado em `registrykmm.azurecr.io/finops-pipeline:latest`
-- [x] `finops-sync-rg-tags` CronJob aplicado — executa diariamente às 04:00 UTC
-- [x] `finops-pipeline` CronJob aplicado — executa diariamente às 06:00 UTC
-- [x] Testados manualmente com sucesso
-
-## Análise do pipeline PS legado (2026-05-13)
-
-Comparação com output do container `finops` (pipeline PowerShell) para 2026-05-12:
-
-| Métrica | Valor |
-|---|---|
-| Total Fact Cost | R$ 8.610,60 |
-| Total Alocado (PS) | R$ 4.338,41 (50,4%) |
-| Total Não Alocado (PS) | R$ 4.272,20 (49,6%) |
-
-**Razões de não-alocação no PS:**
-- `HAS_SERVICEKEY_NO_SHARE` — 99,5% do não-alocado (305 recursos): o PS identificava o ServiceKey mas não tinha share definido
-- `NO_MAPPING_BY_RESOURCEID_OR_RG` — 0,5% (3 recursos)
-
-**Top causas por custo:**
-
-| ServiceKey | Custo | Causa raiz | Solução no Python |
-|---|---|---|---|
-| SQL Elastic Pools (6 pools) | R$ 2.725 (63,9%) | PS sem lógica de rateio por utilização | s03c reescrito: ARM API + Monitor CPU |
-| `AKS:aks-prd-newkmm` (infra MC_) | R$ 472 | PS sem share para infraestrutura | s03b share via OpenCost cobre todos os recursos do cluster |
-| `AKS:aks-hml-newkmm` (infra MC_) | R$ 324 | idem | idem |
-| INFRA / APPGW / RSV | R$ 324 | Sem tag, sem share | s05 distribui por client_weights |
-| `AKS:aks-prd-br-newkmm` | R$ 36 | idem AKS | idem |
-
-**Conclusão:** o pipeline Python resolve estruturalmente todos os gaps do PS. Após rebuild e validação end-to-end, o TotalAllocated deve ser significativamente maior que 50,4%.
+#### aks-mg-kmm-firewall-eus-hml (2026-05-04)
+- Subscription: `3f6d197f-f70b-4c2c-b981-8bb575d47a7a` | RG: `RG-DEV-KMM`
+- Identity: `id-mg-kmm-finops-aks-firewall-eus-hml` (CLIENT_ID: `bffedfaa-5c53-4409-988c-c6884579cebc`)
+- CronJob AKS aplicado — executa diariamente às 05:00 UTC
 
 ---
 
-## s03c — lógica de alocação SQL Elastic Pool (2026-05-13)
+## Validação do pipeline (2026-05-18)
 
-**Antes:** arquivo estático `sql_pool_weights.csv` (nunca criado) + tipo errado (Synapse).
+Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 
-**Depois (dinâmico):**
+| Métrica | Valor |
+|---|---|
+| Escopo | `52d4423b` (KMM PRD) + `3f6d197f` (KMM DEV-TEST) |
+| TotalAllocated | **100,0%** |
+| Método predominante | WEIGHT_PROPORTIONAL + DEDICATED_TAG + AKS_OPENCOST |
+| AKS_OPENCOST | 0% — VMs AKS aparecem como Reserved Instances no FOCUS, sem vínculo direto com cluster |
+| SQLPOOL | Ativo — pools com `ServiceKey=SQLPOOL:{pool_name}`; s03c faz skip gracioso em dias sem pools no FOCUS |
+
+5 outputs do s06 confirmados em `gold/fact_allocated_cost/dt=2026-05-18/`:
+- `fact_allocated_cost_2026-05-18.parquet`
+- `final_cost_by_client_2026-05-18.parquet`
+- `final_cost_detailed_2026-05-18.parquet`
+- `reconciliation_2026-05-18.csv`
+- `unallocated_cost_2026-05-18.csv`
+
+Retrocarga 2026-05-01 a 2026-05-15: 15/15 datas processadas, todas com 100% de alocação.
+Saída em `finops-v2/gold/fact_allocated_cost/dt=<data>/`.
+
+---
+
+## Pendências
+
+### Clusters sem OpenCost (bloquear — instalar OpenCost primeiro)
+- [ ] aks-mg-kmm-dados-eus-prd — instalar OpenCost, depois seguir fluxo de identidade
+- [ ] aks-prd-emissor — migrar para OpenCost, depois seguir fluxo de identidade
+- [ ] aks-mg-kmm-win-eus-hml — instalar OpenCost, depois seguir fluxo de identidade
+
+### Qualidade de dados (melhorias incrementais)
+- [ ] Taguear databases SQL Elastic Pool com `FINOPS-CLIENTE` → s03c mapeia database → cliente pela tag; sem tag, cliente fica como `"DEFINIR"` nos shares
+- [ ] Investigar alocação das Reserved Instances de VMs AKS (aparecem sem RG/cluster no FOCUS) — pendente acesso às reservas para criar `ri_cluster_map.csv`
+- [ ] Corrigir tags numéricas (`FINOPS-CLIENTE=267`, `8`, `35`...) no portal Azure
+
+### Relatórios / Power BI
+- [ ] Power BI — conectar direto no Blob Storage (`finops-v2`) via Azure Storage connector
+- [ ] Criar arquivo consolidado `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet` com todas as datas para facilitar refresh no Power BI (evita leitura de múltiplas partições)
+
+---
+
+## s03c — lógica de alocação SQL Elastic Pool
+
 1. Filtra `Microsoft.Sql/servers/elasticPools` não-dedicados em `resource_to_service`
 2. Para cada pool → `GET .../elasticPools/{pool}/databases` (ARM API)
 3. Para cada database → CPU média via Azure Monitor (`cpu_percent`, agregação diária)
@@ -458,34 +420,7 @@ Comparação com output do container `finops` (pipeline PowerShell) para 2026-05
 
 **Permissões necessárias:** `Reader` nas subscriptions (já atribuído) — suficiente para ARM list e Monitor metrics.
 
----
-
-## Próximos passos
-
-### 1. Rebuild da imagem — obrigatório (s03c reescrito)
-```bash
-az acr build --registry registrykmm --image finops-pipeline:latest .
-```
-
-### 2. Validação end-to-end do pipeline Python
-Rodar manualmente para uma data e comparar com o output do PS:
-```bash
-az aks get-credentials --resource-group RG-US-PRD-KMM --name aks-prd-newkmm --overwrite-existing
-kubectl create job --from=cronjob/finops-pipeline finops-pipeline-test-$(date +%s) -n finops
-kubectl logs -f job/<nome-gerado> -n finops
-```
-Verificar em `finops-v2`:
-- `gold/fact_allocated_cost/dt=<data>/` — AllocatedCost total deve cobrir ~100% do custo
-- `gold/sql_pool_allocation_share/dt=<data>/` — deve existir com shares por pool
-- Comparar `gold/allocation_share_final` com `gold/reconciliation` do container `finops`
-
-### 3. Tag FINOPS-CLIENTE nos databases SQL
-Para o s03c funcionar corretamente, cada database nos elastic pools precisa ter a tag `FINOPS-CLIENTE` com o nome do cliente. Verificar quais databases estão sem tag e tagear.
-
-### 4. Clusters sem OpenCost (bloqueados)
-- `aks-mg-kmm-dados-eus-prd` — instalar OpenCost, depois aplicar CronJob
-- `aks-prd-emissor` — migrar para OpenCost, depois aplicar CronJob
-- `aks-mg-kmm-win-eus-hml` — instalar OpenCost, depois aplicar CronJob
+**Status atual (2026-05-19):** s03c ativo e integrado ao pipeline. Elastic pools recebem `ServiceKey=SQLPOOL:{pool_name}` e `ServiceType=sql_pool` em s02. Quando pools aparecem no FOCUS (datas com cobrança de pool), s03c processa via ARM API + Azure Monitor. Quando não há pools na data, s03c faz skip gracioso sem falha. Os databases ainda não têm tag `FINOPS-CLIENTE`, portanto o cliente associado fica como `"DEFINIR"` nos shares — taguear os databases melhora a rastreabilidade.
 
 ---
 
@@ -512,14 +447,6 @@ source .venv/bin/activate        # Linux/Mac
 pip install -r requirements.txt
 ```
 
-### Criar container finops-v2
-```bash
-az storage container create \
-  --account-name stpslkmmfinopseusprd \
-  --name finops-v2 \
-  --auth-mode login
-```
-
 ### Build da imagem
 ```bash
 az acr build --registry registrykmm --image finops-pipeline:latest .
@@ -532,13 +459,28 @@ kubectl create namespace finops --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f k8s/cronjob-aks.yaml
 ```
 
-### Teste manual do job AKS
+### Teste manual — pipeline principal
 ```bash
-kubectl create job \
-  --from=cronjob/finops-aks-allocation \
-  finops-aks-test-$(date +%s) \
-  -n finops
+az aks get-credentials --resource-group RG-US-PRD-KMM --name aks-prd-newkmm --overwrite-existing
+kubectl create job --from=cronjob/finops-pipeline finops-pipeline-test-$(date +%s) -n finops
 kubectl logs -f job/<nome-gerado> -n finops
+```
+
+### Teste manual — data específica (retrocarga)
+```bash
+# Via script Python (sequencial, todas as datas de uma vez)
+python sh/retro_may.py
+
+# Via kubectl com override de data (uma data)
+kubectl get cronjob finops-pipeline -n finops -o json | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+spec = d['spec']['jobTemplate']['spec']
+for c in spec['template']['spec']['containers']:
+    if c['name'] == 'finops-pipeline':
+        c.setdefault('env', []).append({'name': 'PIPELINE_DATE', 'value': '2026-05-10'})
+print(json.dumps({'apiVersion':'batch/v1','kind':'Job','metadata':{'name':'finops-retro-test','namespace':'finops'},'spec':spec}))
+" | kubectl apply -f -
 ```
 
 ### Enviar config/reference para o Blob
