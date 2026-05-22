@@ -409,17 +409,42 @@ def run(pipeline_date: str | None = None) -> None:
             r["ContribDiskPct"] = round(contrib_disk, 4)
             r["WeightedUsage"]  = round(weighted, 6)
 
-        total_weighted = sum(r["WeightedUsage"] for r in detail_rows)
-        logger.info(f"TotalWeighted={total_weighted:.6f}")
+        # Separa DBs de infra (sem tag FINOPS-CLIENTE) dos DBs de clientes tagueados.
+        # O custo dos DBs de infra é redistribuído proporcionalmente ao uso dos clientes
+        # tagueados no mesmo pool — quem usa mais absorve mais do custo compartilhado.
+        infra_rows    = [r for r in detail_rows if r["Cliente"] == "DEFINIR"]
+        billable_rows = [r for r in detail_rows if r["Cliente"] != "DEFINIR"]
+
+        if infra_rows:
+            infra_dbs = [r["Database"] for r in infra_rows]
+            logger.info("  ♻ DBs sem tag (infra compartilhada) → redistribuídos: %s", infra_dbs)
+
+        # Denominador: apenas os billable (redistribui infra proporcionalmente).
+        # Se não há billable (pool 100% infra), usa todos os DBs como fallback.
+        rows_for_share = billable_rows if billable_rows else detail_rows
+        total_weighted = sum(r["WeightedUsage"] for r in rows_for_share)
+        logger.info(
+            "TotalWeighted(todos)=%.6f | TotalWeighted(billable)=%.6f",
+            sum(r["WeightedUsage"] for r in detail_rows), total_weighted,
+        )
 
         # Share — com fallback igual por DB se weighted = 0
         fallback = False
         if total_weighted <= 0:
-            logger.warning(f"⚠ TotalWeighted=0 → fallback igual por {len(detail_rows)} DBs")
+            logger.warning(f"⚠ TotalWeighted=0 → fallback igual por {len(rows_for_share)} DBs")
             fallback = True
-            equal_share = 1.0 / len(detail_rows)
+            equal_share = 1.0 / len(rows_for_share)
 
         for r in detail_rows:
+            if r["Cliente"] == "DEFINIR":
+                # Infra: registra no detail para auditoria, não gera linha de alocação
+                r["Share"]         = 0.0
+                r["AllocatedCost"] = 0.0
+                r["PoolDailyCost"] = pool_daily_cost
+                r["DriverFallback"] = "REDISTRIBUTED_TO_CLIENTS"
+                all_detail.append(r)
+                continue
+
             if fallback:
                 share = equal_share
                 driver = "SQLPOOL_DB_COUNT_FALLBACK"
