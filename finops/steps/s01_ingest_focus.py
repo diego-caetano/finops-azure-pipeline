@@ -30,6 +30,17 @@ _FOCUS_PREFIX = os.getenv("FOCUS_PREFIX", "costexport/azure-cost-export-focus10-
 _FACT_COST_PREFIX = os.getenv("FACT_COST_PREFIX", "silver/fact_cost")
 _MAX_PARTITIONS = 6
 
+# Subscriptions de faturamento cujos recursos devem ser incluídos no pipeline.
+# Separadas por vírgula. Vazio = sem filtro (não recomendado em produção).
+_BILLING_SUBSCRIPTION_IDS: frozenset[str] = frozenset(
+    s.strip().lower()
+    for s in os.getenv(
+        "BILLING_SUBSCRIPTION_IDS",
+        "52d4423b-7ed9-4673-b8e2-fa21cdb83176,3f6d197f-f70b-4c2c-b981-8bb575d47a7a",
+    ).split(",")
+    if s.strip()
+)
+
 # Colunas FOCUS → fact_cost. Inclui alternativas para variações do export Azure.
 _COLUMN_CANDIDATES: dict[str, list[str]] = {
     "ResourceId":        ["ResourceId"],
@@ -188,7 +199,25 @@ def run(pipeline_date: Optional[str] = None) -> None:
         logger.warning("⚠ ResourceGroupName ausente — extraindo do ResourceId")
         df_out["ResourceGroupName"] = df_out["ResourceId"].apply(_extract_rg_from_resource_id)
 
-    # 5. Keep only fact_cost columns that exist
+    # 5. Filtro de subscriptions — mantém apenas as subscriptions alvo do pipeline
+    # FOCUS armazena SubscriptionId como "/subscriptions/{guid}" — strip do prefixo antes de comparar
+    if _BILLING_SUBSCRIPTION_IDS and "SubscriptionId" in df_out.columns:
+        before = len(df_out)
+        sub_ids_normalized = (
+            df_out["SubscriptionId"]
+            .str.lower()
+            .str.replace(r"^.*/subscriptions/", "", regex=True)
+        )
+        df_out = df_out[sub_ids_normalized.isin(_BILLING_SUBSCRIPTION_IDS)].copy()
+        dropped = before - len(df_out)
+        logger.info(
+            "📋 Filtro subscriptions: %d → %d linhas (%d removidas de outras subscriptions)",
+            before, len(df_out), dropped,
+        )
+    elif "SubscriptionId" not in df_out.columns:
+        logger.warning("⚠ Coluna SubscriptionId ausente — filtro de subscription não aplicado")
+
+    # 6. Keep only fact_cost columns that exist
     available = [c for c in _FACT_COST_COLUMNS if c in df_out.columns]
     missing = [c for c in _FACT_COST_COLUMNS if c not in df_out.columns]
     if missing:
@@ -200,7 +229,7 @@ def run(pipeline_date: Optional[str] = None) -> None:
 
     logger.info("✅ fact_cost: %d linhas, custo total=%.2f", len(df_out), df_out["Cost"].sum())
 
-    # 6. Write output
+    # 7. Write output
     blob_name = f"{_FACT_COST_PREFIX}/{to_partition(date_str)}/fact_cost.parquet"
     pipe_store.write_parquet(blob_name, df_out)
     logger.info("⬆️  Gravado: %s", blob_name)

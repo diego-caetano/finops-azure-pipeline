@@ -66,8 +66,19 @@ def run(pipeline_date: Optional[str] = None) -> None:
         df_day = store.read_parquet(day_blob)
         n_day = len(df_day)
         total_day = float(df_day["AllocatedCost"].sum())
-        total_cost_day = float(df_day["Cost"].sum())
         logger.info("📊 parquet do dia: %d linhas | R$ %.2f alocados", n_day, total_day)
+
+        # TotalCost vem da reconciliation (TotalFactCost = custo real sem duplicação do fan-out)
+        recon_blob = (
+            f"{_FACT_PREFIX}/{to_partition(date_str)}"
+            f"/reconciliation_{date_str}.csv"
+        )
+        try:
+            df_recon = store.read_csv(recon_blob)
+            total_cost_day = float(df_recon["TotalFactCost"].iloc[0])
+        except Exception:
+            logger.warning("⚠ reconciliation não encontrada — TotalCost será 0")
+            total_cost_day = 0.0
 
         # ── Step 2: Carrega consolidado existente ─────────────────────────
         try:

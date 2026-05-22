@@ -16,6 +16,7 @@ Hierarquia:
 import json
 import logging
 import os
+import re
 from typing import Optional
 
 import numpy as np
@@ -188,6 +189,19 @@ def run(pipeline_date: Optional[str] = None) -> None:
     notes = pd.Series("", index=df.index, dtype=str).where(
         ~rule4_wins, "cluster=" + aks_cluster.fillna("")
     )
+
+    # ── SQL Elastic Pool override: SQLPOOL:{pool_name} ────────────────────
+    is_elasticpool = df["ResourceType"].str.lower() == "microsoft.sql/servers/elasticpools"
+    if is_elasticpool.any():
+        pool_name_extracted = rid.str.extract(r"/elasticPools/([^/]+)$", flags=re.IGNORECASE)[0]
+        valid_pool = is_elasticpool & pool_name_extracted.notna()
+        service_key = service_key.where(
+            ~valid_pool,
+            "SQLPOOL:" + pool_name_extracted.fillna("").str.lower(),
+        )
+        service_type_s = pd.Series(service_type, index=df.index)
+        service_type_s[valid_pool] = "sql_pool"
+        service_type = service_type_s.values
 
     # ── Monta output ───────────────────────────────────────────────────────
     df_out = pd.DataFrame({

@@ -66,7 +66,7 @@ _STEPS = [
 
 def main() -> None:
     pipeline_date = os.environ.get("PIPELINE_DATE") or None
-    logger.info("🚀 finops-pipeline iniciado  date=%s", pipeline_date or "auto(D-1 BRT)")
+    logger.info("🚀 finops-pipeline iniciado  date=%s", pipeline_date or "auto(D-3 BRT)")
 
     for name, step_fn in _STEPS:
         logger.info("▶️  %s  [RSS=%.0fMB]", name, _rss_mb())

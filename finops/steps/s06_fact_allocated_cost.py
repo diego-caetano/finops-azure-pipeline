@@ -19,7 +19,7 @@ from typing import Optional
 
 import pandas as pd
 
-from finops.storage import pipeline_client, upload_parquet
+from finops.storage import pipeline_client, upload_csv, upload_parquet
 from finops.utils.dates import resolve_pipeline_date, to_partition
 
 logger = logging.getLogger(__name__)
@@ -173,7 +173,7 @@ def run(pipeline_date: Optional[str] = None) -> None:
 
     # ── Output 2: final_cost_by_client_{date}.parquet ─────────────────────
     ded = (
-        df_out.loc[df_out["AllocationMethod"] == _DEDICATED_METHOD]
+        df_out.loc[df_out["AllocationMethod"].str.startswith("DEDICATED", na=False)]
         .groupby("Cliente")["AllocatedCost"].sum()
     )
     tot = df_out.groupby("Cliente")["AllocatedCost"].sum()
@@ -225,7 +225,7 @@ def run(pipeline_date: Optional[str] = None) -> None:
         float(unalloc_no_share["Cost"].sum() if not unalloc_no_share.empty else 0.0)
         # unalloc_zero não soma (Cost=0, recurso coberto por outros clientes)
     )
-    difference = round(total_allocated + total_unallocated - total_billed, 6)
+    difference = round(total_billed - total_allocated - total_unallocated, 6)
     alloc_pct = round(100.0 * total_allocated / total_billed, 6) if total_billed else 0.0
     unalloc_pct = round(100.0 * total_unallocated / total_billed, 6) if total_billed else 0.0
 
@@ -233,9 +233,12 @@ def run(pipeline_date: Optional[str] = None) -> None:
         "💰 TotalFactCost=%.6f | TotalAllocated=%.6f (%.1f%%) | TotalUnallocated=%.6f (%.1f%%) | Diff=%.6f",
         total_billed, total_allocated, alloc_pct, total_unallocated, unalloc_pct, difference,
     )
-    warn_threshold = max(1.0, total_billed * 0.0001)  # > R$1 OU > 0.01% do total
-    if abs(difference) > warn_threshold:
-        logger.warning("⚠ Diferença de reconciliação %.6f supera threshold %.6f", difference, warn_threshold)
+    if abs(difference) > 0.01:
+        raise ValueError(
+            f"Reconciliation falhou: difference={difference:.6f} "
+            f"(total_billed={total_billed:.6f}, allocated={total_allocated:.6f}, "
+            f"unallocated={total_unallocated:.6f})"
+        )
 
     # ── Output 4: reconciliation_{date}.csv ──────────────────────────────
     df_recon = pd.DataFrame([{
@@ -249,7 +252,7 @@ def run(pipeline_date: Optional[str] = None) -> None:
     }], columns=_RECONCILIATION_COLUMNS)
 
     blob4 = f"{out_dir}/reconciliation_{date_str}.csv"
-    store.write_csv(blob4, df_recon)
+    upload_csv(df_recon, storage_account, container, blob4)
     logger.info("✅ reconciliation → %s", blob4)
 
     # ── Output 5: unallocated_cost_{date}.csv ─────────────────────────────
@@ -274,7 +277,7 @@ def run(pipeline_date: Optional[str] = None) -> None:
         df_unalloc = pd.DataFrame(columns=_UNALLOCATED_COLUMNS)
 
     blob5 = f"{out_dir}/unallocated_cost_{date_str}.csv"
-    store.write_csv(blob5, df_unalloc)
+    upload_csv(df_unalloc, storage_account, container, blob5)
     logger.info("✅ unallocated_cost: %d linhas → %s", len(df_unalloc), blob5)
 
     logger.info(

@@ -1,5 +1,7 @@
 azure-identity>=1.16.0
 azure-mgmt-resource>=23.0.0
+azure-mgmt-sql>=3.0.0
+azure-monitor-query==1.3.0
 azure-storage-blob>=12.19.0
 pandas>=2.2.0
 pyarrow>=15.0.0

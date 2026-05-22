@@ -36,7 +36,13 @@ data:
   CLIENT_WEIGHTS_PREFIX: "silver/client_weights"
   ALLOCATION_SHARE_FINAL_PREFIX: "gold/allocation_share_final"
   FACT_ALLOCATED_COST_PREFIX: "gold/fact_allocated_cost"
+  # Subscriptions de faturamento incluídas no pipeline (filtro aplicado em s01)
+  BILLING_SUBSCRIPTION_IDS: "52d4423b-7ed9-4673-b8e2-fa21cdb83176,3f6d197f-f70b-4c2c-b981-8bb575d47a7a"
   # Pipeline
+  # PIPELINE_DATE vazio = automático D-3 BRT (FOCUS billing lag confirmado em prod)
+  # Lags maiores (RI, Savings Plans, virada de mês) cobertos pelo CronJob
+  # finops-retro-fix toda segunda-feira às 07:00 UTC.
+  # Para retrocarga manual: definir PIPELINE_DATE=yyyy-MM-dd
   PIPELINE_DATE: ""
   LOG_LEVEL: "INFO"
 ---

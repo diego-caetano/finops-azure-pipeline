@@ -1,341 +1,496 @@
 """
-s03c_sql_pool.py — Alocação de SQL Elastic Pools por utilização de databases.
+s03c_sql_pool.py — Alocação SQL Pool via métricas Azure Monitor
+================================================================
+Porta fiel do script 07 (PowerShell) para Python.
 
-Para cada recurso Microsoft.Sql/servers/elasticPools não-dedicado em r2s:
-  1. Lista os databases do pool via Azure Management API
-  2. Obtém CPU média e Disk média via Azure Monitor (cpu_percent, storage_percent)
-  3. Score por database = CPU*0.97 + Disk*0.03
-  4. Fallback quando score=0: peso igual entre todos os databases (1/N)
-  5. Mapeia database → cliente via tag FINOPS-CLIENTE no database
-  6. Databases sem tag (ou COMPARTILHADO) redistribuídos proporcionalmente
-  7. AllocatedCost = PoolDailyCost × Share (calculado a partir do fact_cost)
-  8. Grava shares (sql_pool.csv) e auditoria (sqlpool_detail_all.csv)
+Lógica central:
+  1. Lê resource_to_service para identificar ServiceKeys do tipo SQLPOOL:
+  2. Para cada pool, lista os bancos de dados via az sql db list
+  3. Coleta métricas de CPU% e Storage% via Azure Monitor (janela = UsageDate)
+  4. Calcula share ponderado: WeightedUsage = (CPU/totalCPU)*CpuWeight + (Disk/totalDisk)*DiskWeight
+  5. Share por cliente = WeightedUsage / totalWeightedUsage
+  6. Fallback: se métricas = 0, divide igualmente por número de DBs
 
-Roda no pipeline central (06:00 UTC, aks-prd-newkmm).
-A identity precisa de Reader nas subscriptions onde os SQL Servers residem.
+Pesos padrão (equivalente ao script 07 PS):
+  CpuWeight  = 0.97
+  DiskWeight = 0.03
+
+Outputs (espelho exato dos CSVs do script 07):
+  gold/sqlpool_allocation_share_metrics/dt=<date>/
+    sqlpool_detail_all_<date>.csv
+    sqlpool_allocation_share_all_<date>.csv
 """
+from __future__ import annotations
 
 import logging
 import os
 import re
-import time
-from datetime import date, timedelta
-from typing import Optional
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
-import requests
 from azure.identity import DefaultAzureCredential
+from azure.monitor.query import MetricsQueryClient, MetricAggregationType
+from azure.mgmt.sql import SqlManagementClient
 
-from finops.storage import pipeline_client
-from finops.utils.dates import resolve_pipeline_date, to_partition
+from finops.storage import download_csv_with_fallback, upload_csv
+from finops.utils.dates import brazil_today, parse_usage_date, resolve_pipeline_date
 
 logger = logging.getLogger(__name__)
 
-_FACT_COST_PREFIX = os.getenv("FACT_COST_PREFIX", "silver/fact_cost")
-_R2S_PREFIX = os.getenv("RESOURCE_TO_SERVICE_PREFIX", "silver/resource_to_service")
-_SQL_POOL_OUT_PREFIX = os.getenv("SQL_POOL_OUT_PREFIX", "gold/sql_pool_allocation_share")
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+PIPELINE_STORAGE_ACCOUNT     = os.environ.get("PIPELINE_STORAGE_ACCOUNT", "stpslkmmfinopseusprd")
+PIPELINE_CONTAINER           = os.environ.get("PIPELINE_CONTAINER", "finops-v2")
+RESOURCE_TO_SERVICE_PREFIX   = os.environ.get("RESOURCE_TO_SERVICE_PREFIX", "silver/resource_to_service")
+FACT_COST_PREFIX             = os.environ.get("FACT_COST_PREFIX", "silver/fact_cost")
+OUT_PREFIX                   = os.environ.get("SQL_POOL_OUT_PREFIX", "gold/sql_pool_allocation_share")
 
-_ARM_BASE = "https://management.azure.com"
-_ARM_SCOPE = "https://management.azure.com/.default"
-_RETRY_COUNT = 3
-_RETRY_DELAY = 2.0
+CPU_WEIGHT  = float(os.environ.get("SQL_CPU_WEIGHT",  "0.97"))
+DISK_WEIGHT = float(os.environ.get("SQL_DISK_WEIGHT", "0.03"))
 
-_ELASTIC_POOL_TYPE = "microsoft.sql/servers/elasticpools"
-_SYSTEM_DBS = {"master", "tempdb", "msdb", "model"}
-_TAG_KEY = "FINOPS-CLIENTE"
-_COMPARTILHADO = "COMPARTILHADO"
-_CPU_WEIGHT = 0.97
-_DISK_WEIGHT = 0.03
-
-_SHARE_COLUMNS = ["Date", "ServiceKey", "Cliente", "Share", "DriverType", "AllocationMethod"]
-_DETAIL_COLUMNS = [
-    "Date", "ServiceKey", "PoolResourceId", "Server", "Pool",
-    "DatabaseName", "Cliente", "CpuAvg", "DiskAvg", "Score",
-    "Share", "PoolDailyCost", "AllocatedCost",
+TARGET_SUBSCRIPTIONS = [
+    s.strip()
+    for s in os.environ.get(
+        "SUBSCRIPTION_IDS",
+        "52d4423b-7ed9-4673-b8e2-fa21cdb83176,3f6d197f-f70b-4c2c-b981-8bb575d47a7a"
+    ).split(",")
+    if s.strip()
 ]
 
-
 # ---------------------------------------------------------------------------
-# Resource ID parsing
-# ---------------------------------------------------------------------------
-
-_POOL_RE = re.compile(
-    r"/subscriptions/(?P<sub>[^/]+)"
-    r"/resourceGroups/(?P<rg>[^/]+)"
-    r"/providers/[Mm]icrosoft\.Sql/servers/(?P<server>[^/]+)"
-    r"/elasticPools/(?P<pool>[^/]+)",
-    re.IGNORECASE,
-)
-
-
-def _parse_pool_id(rid: str) -> dict:
-    m = _POOL_RE.match(rid)
-    if not m:
-        return {}
-    return {k: m.group(k) for k in ("sub", "rg", "server", "pool")}
-
-
-# ---------------------------------------------------------------------------
-# Azure REST client
+# Helpers
 # ---------------------------------------------------------------------------
 
-class _ArmClient:
-    """Thin Azure Management REST wrapper with exponential-backoff retry."""
-
-    def __init__(self) -> None:
-        self._cred = DefaultAzureCredential()
-
-    def _headers(self) -> dict:
-        token = self._cred.get_token(_ARM_SCOPE).token
-        return {"Authorization": f"Bearer {token}"}
-
-    def _get(self, url: str, params: dict | None = None) -> dict:
-        last_exc: Exception | None = None
-        for attempt in range(1, _RETRY_COUNT + 1):
-            try:
-                resp = requests.get(url, headers=self._headers(), params=params, timeout=30)
-                resp.raise_for_status()
-                return resp.json()
-            except Exception as exc:
-                last_exc = exc
-                if attempt < _RETRY_COUNT:
-                    wait = _RETRY_DELAY * (2 ** (attempt - 1))
-                    logger.warning("⚠ ARM tentativa %d falhou: %s — aguardando %.1fs", attempt, exc, wait)
-                    time.sleep(wait)
-        raise last_exc  # type: ignore[misc]
-
-    def list_pool_databases(self, sub: str, rg: str, server: str, pool: str) -> list[dict]:
-        url = (
-            f"{_ARM_BASE}/subscriptions/{sub}/resourceGroups/{rg}"
-            f"/providers/Microsoft.Sql/servers/{server}/elasticPools/{pool}/databases"
-        )
-        return self._get(url, {"api-version": "2021-11-01"}).get("value", [])
-
-    def _get_metric(
-        self, sub: str, rg: str, server: str, db: str, metric: str, date_str: str
-    ) -> float:
-        next_day = (date.fromisoformat(date_str) + timedelta(days=1)).isoformat()
-        url = (
-            f"{_ARM_BASE}/subscriptions/{sub}/resourceGroups/{rg}"
-            f"/providers/Microsoft.Sql/servers/{server}/databases/{db}"
-            f"/providers/microsoft.insights/metrics"
-        )
-        params = {
-            "api-version": "2018-01-01",
-            "metricnames": metric,
-            "timespan": f"{date_str}T00:00:00Z/{next_day}T00:00:00Z",
-            "interval": "P1D",
-            "aggregation": "Average",
-        }
-        try:
-            resp = self._get(url, params)
-            for m in resp.get("value", []):
-                for series in m.get("timeseries", []):
-                    for pt in series.get("data", []):
-                        v = pt.get("average")
-                        if v is not None:
-                            return float(v)
-        except Exception as exc:
-            logger.debug("⚠ Métrica %s indisponível para %s/%s: %s", metric, server, db, exc)
+def _parse_float(value) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).strip().replace(",", "."))
+    except (ValueError, TypeError):
         return 0.0
 
-    def get_db_metrics(
-        self, sub: str, rg: str, server: str, db: str, date_str: str
-    ) -> tuple[float, float]:
-        """Return (cpu_avg, disk_avg) for the database on the target date."""
-        cpu = self._get_metric(sub, rg, server, db, "cpu_percent", date_str)
-        disk = self._get_metric(sub, rg, server, db, "storage_percent", date_str)
-        return cpu, disk
+
+def _fmt6(value) -> str:
+    return f"{_parse_float(value):.6f}"
 
 
-# ---------------------------------------------------------------------------
-# Per-pool share computation
-# ---------------------------------------------------------------------------
-
-def _compute_pool_shares(
-    arm: _ArmClient,
-    service_key: str,
-    resource_id: str,
-    pool_daily_cost: float,
-    date_str: str,
-) -> tuple[list[dict], list[dict]]:
+def _parse_pool_from_resource_id(rid: str) -> dict | None:
     """
-    Return (share_rows, detail_rows) for one elastic pool.
-    Returns ([], []) if pool cannot be processed.
+    Extrai SubscriptionId, ResourceGroup, Server e Pool do ResourceId.
+    Equivalente a Get-PoolInfoFromResourceId do PS.
     """
-    parts = _parse_pool_id(resource_id)
-    if not parts:
-        logger.warning("⚠ Não foi possível parsear ResourceId: %s", resource_id)
-        return [], []
-
-    sub, rg, server, pool = parts["sub"], parts["rg"], parts["server"], parts["pool"]
-    logger.info("🔍 Pool: %s/%s  custo=%.4f", server, pool, pool_daily_cost)
-
-    try:
-        databases = arm.list_pool_databases(sub, rg, server, pool)
-    except Exception as exc:
-        logger.warning("⚠ Falha ao listar databases de %s/%s: %s", server, pool, exc)
-        return [], []
-
-    # Filter system databases
-    user_dbs = [db for db in databases if db.get("name", "").lower() not in _SYSTEM_DBS]
-    if not user_dbs:
-        logger.warning("⚠ Nenhum database de usuário encontrado em %s/%s", server, pool)
-        return [], []
-
-    n_dbs = len(user_dbs)
-    equal_weight = 1.0 / n_dbs  # fallback weight when all metrics are zero
-
-    # Gather per-database data
-    db_records: list[dict] = []
-    for db_obj in user_dbs:
-        db_name = db_obj.get("name", "")
-
-        tags = db_obj.get("tags") or {}
-        cliente = next(
-            (str(v).strip().upper() for k, v in tags.items() if k.upper() == _TAG_KEY),
-            None,
-        )
-        if cliente == _COMPARTILHADO:
-            cliente = None
-
-        cpu, disk = arm.get_db_metrics(sub, rg, server, db_name, date_str)
-        score = cpu * _CPU_WEIGHT + disk * _DISK_WEIGHT
-        logger.debug("DB %s → cliente=%s  cpu=%.4f  disk=%.4f  score=%.4f", db_name, cliente, cpu, disk, score)
-        db_records.append({"name": db_name, "cliente": cliente, "cpu": cpu, "disk": disk, "score": score})
-
-    total_score = sum(r["score"] for r in db_records)
-
-    # Fallback: if all scores are zero, use equal weight (1/N)
-    if total_score == 0.0:
-        logger.warning("⚠ Todos os scores são 0 em %s/%s — usando peso igual (1/%d)", server, pool, n_dbs)
-        for r in db_records:
-            r["score"] = equal_weight
-        total_score = 1.0
-
-    # Group scores by client
-    client_score: dict[str, float] = {}
-    unmapped_score = 0.0
-    for r in db_records:
-        if r["cliente"]:
-            client_score[r["cliente"]] = client_score.get(r["cliente"], 0.0) + r["score"]
-        else:
-            unmapped_score += r["score"]
-
-    if not client_score:
-        logger.warning("⚠ Nenhum database com tag FINOPS-CLIENTE em %s/%s — pool sem share", server, pool)
-        return [], []
-
-    # Redistribute unmapped proportionally (same pattern as s03b system namespaces)
-    mapped_total = sum(client_score.values())
-    redistrib_factor = 1.0 + (unmapped_score / mapped_total)
-    client_score_adj = {c: v * redistrib_factor for c, v in client_score.items()}
-    grand_total = sum(client_score_adj.values())
-
-    # Build share rows
-    client_shares = {
-        c: round(s / grand_total, 6) for c, s in client_score_adj.items()
+    pattern = (
+        r"^/subscriptions/(?P<sub>[^/]+)"
+        r"/resourceGroups/(?P<rg>[^/]+)"
+        r"/providers/Microsoft\.Sql/servers/(?P<server>[^/]+)"
+        r"/elasticPools/(?P<pool>[^/]+)$"
+    )
+    m = re.match(pattern, rid.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    return {
+        "SubscriptionId": m.group("sub"),
+        "ResourceGroup":  m.group("rg"),
+        "Server":         m.group("server"),
+        "Pool":           m.group("pool"),
     }
 
-    share_rows = [
-        {
-            "Date": date_str,
-            "ServiceKey": service_key,
-            "Cliente": cliente,
-            "Share": share,
-            "DriverType": "SQL_CPU_DISK_UTILIZATION",
-            "AllocationMethod": "SQL_ELASTIC_POOL_CPU_DISK",
-        }
-        for cliente, share in client_shares.items()
+
+def _build_day_window(usage_date: str) -> tuple[datetime, datetime]:
+    """
+    Retorna (start, end) UTC para a janela de métricas do dia.
+    Equivalente a Build-DayWindowUtc do PS.
+    """
+    start = datetime.strptime(usage_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end   = start + timedelta(hours=23, minutes=59, seconds=59)
+    return start, end
+
+
+# ---------------------------------------------------------------------------
+# Azure Monitor — métricas por banco de dados
+# ---------------------------------------------------------------------------
+
+def _get_metric_avg(
+    metrics_client: MetricsQueryClient,
+    resource_id: str,
+    metric_name: str,
+    start: datetime,
+    end: datetime,
+    precision: int = 4,
+) -> float:
+    """
+    Retorna a média de uma métrica para um recurso no período.
+    Equivalente a Get-MetricAvg do PS.
+    """
+    try:
+        response = metrics_client.query_resource(
+            resource_uri=resource_id,
+            metric_names=[metric_name],
+            timespan=(start, end),
+            granularity=timedelta(hours=1),
+            aggregations=[MetricAggregationType.AVERAGE],
+        )
+        values = []
+        for metric in response.metrics:
+            for ts in metric.timeseries:
+                for dp in ts.data:
+                    if dp.average is not None:
+                        values.append(dp.average)
+
+        if not values:
+            return 0.0
+        return round(sum(values) / len(values), precision)
+
+    except Exception as exc:
+        logger.warning(f"⚠ Métrica {metric_name} falhou para {resource_id}: {exc}")
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Lista de bancos no pool — az sql db list equivalente
+# ---------------------------------------------------------------------------
+
+def _get_databases_in_pool(
+    credential: DefaultAzureCredential,
+    subscription_id: str,
+    resource_group: str,
+    server: str,
+    pool: str,
+) -> list[str]:
+    """
+    Lista os bancos de dados pertencentes a um elastic pool.
+    Equivalente a Get-DbNamesInPool do PS.
+    """
+    try:
+        sql_client = SqlManagementClient(credential, subscription_id)
+        dbs = sql_client.databases.list_by_server(resource_group, server)
+        result = []
+        for db in dbs:
+            if db.elastic_pool_id and pool.lower() in db.elastic_pool_id.lower():
+                result.append(db.name)
+        return sorted(set(result))
+    except Exception as exc:
+        logger.warning(
+            f"⚠ Erro ao listar DBs do pool {pool} em {server}: {exc}"
+        )
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint principal
+# ---------------------------------------------------------------------------
+
+def run(pipeline_date: str | None = None) -> None:
+    """
+    Executa o step SQL Pool completo.
+    Equivalente ao fluxo principal do script 07 PS.
+    """
+    pipeline_date = resolve_pipeline_date(pipeline_date)
+    logger.info(f"🚀 s03c_sql_pool iniciado")
+    logger.info(f"📅 Pipeline date: {pipeline_date}")
+    logger.info(f"📅 Publish date : {brazil_today()}")
+    logger.info(f"⚖  Pesos: CPU={CPU_WEIGHT} | Disk={DISK_WEIGHT}")
+
+    credential = DefaultAzureCredential()
+
+    # ── Downloads ─────────────────────────────────────────────────────────
+    logger.info("\n== DOWNLOAD INPUTS ==")
+
+    df_rts, _, _ = download_csv_with_fallback(
+        PIPELINE_STORAGE_ACCOUNT, PIPELINE_CONTAINER,
+        RESOURCE_TO_SERVICE_PREFIX, pipeline_date,
+        r"resource_to_service.*\.csv$",
+    )
+
+    df_fact, _, _ = download_csv_with_fallback(
+        PIPELINE_STORAGE_ACCOUNT, PIPELINE_CONTAINER,
+        FACT_COST_PREFIX, pipeline_date,
+        r"^fact_cost_.*\.csv$",
+    )
+
+    # ── Deriva UsageDate do conteúdo do fact_cost ──────────────────────────
+    date_col = next(
+        (c for c in ("Date", "UsageDate", "UsageDateTime") if c in df_fact.columns),
+        None,
+    )
+    if date_col is None:
+        raise ValueError("fact_cost sem coluna de data reconhecível")
+
+    usage_date = (
+        df_fact[date_col]
+        .dropna()
+        .apply(parse_usage_date)
+        .dropna()
+        .max()
+    )
+    logger.info(f"📅 UsageDate derivada: {usage_date}")
+
+    # filtra fact_cost pela UsageDate
+    df_fact = df_fact[
+        df_fact[date_col].apply(parse_usage_date) == usage_date
+    ].copy()
+
+    # ── Índice custo diário por ServiceKey ─────────────────────────────────
+    daily_cost_by_sk: dict[str, float] = {}
+    for _, row in df_fact.iterrows():
+        rid = str(row.get("ResourceId", "") or "").strip()
+        if not rid:
+            continue
+        sk_rows = df_rts[
+            df_rts["ResourceId"].astype(str).str.strip().str.lower() == rid.lower()
+        ]
+        if sk_rows.empty:
+            continue
+        sk = str(sk_rows.iloc[0]["ServiceKey"]).strip()
+        cost = _parse_float(row.get("Cost", 0))
+        daily_cost_by_sk[sk] = daily_cost_by_sk.get(sk, 0.0) + cost
+
+    # ── Identifica pools SQLPOOL no resource_to_service ───────────────────
+    logger.info("\n== DESCOBRINDO SQL POOLS ==")
+    pools_seen: set[str] = set()
+    pools: list[dict] = []
+
+    sql_rows = df_rts[
+        df_rts["ServiceKey"].astype(str).str.upper().str.startswith("SQLPOOL:")
+        & (df_rts["ResourceType"].astype(str).str.lower() == "microsoft.sql/servers/elasticpools")
     ]
 
-    # Build detail rows for audit
-    detail_rows = []
-    for r in db_records:
-        db_share = r["score"] / grand_total if grand_total > 0 else 0.0
-        allocated = round(pool_daily_cost * db_share, 6)
-        detail_rows.append({
-            "Date": date_str,
-            "ServiceKey": service_key,
-            "PoolResourceId": resource_id,
-            "Server": server,
-            "Pool": pool,
-            "DatabaseName": r["name"],
-            "Cliente": r["cliente"] or "",
-            "CpuAvg": round(r["cpu"], 6),
-            "DiskAvg": round(r["disk"], 6),
-            "Score": round(r["score"], 6),
-            "Share": round(db_share, 6),
-            "PoolDailyCost": round(pool_daily_cost, 6),
-            "AllocatedCost": allocated,
+    for _, row in sql_rows.iterrows():
+        rid = str(row.get("ResourceId", "")).strip()
+        sk  = str(row.get("ServiceKey", "")).strip()
+        info = _parse_pool_from_resource_id(rid)
+        if not info:
+            continue
+        key = f"{info['SubscriptionId']}|{info['ResourceGroup']}|{info['Server']}|{info['Pool']}"
+        if key in pools_seen:
+            continue
+        pools_seen.add(key)
+        pools.append({**info, "ServiceKey": sk})
+
+    if not pools:
+        logger.info("ℹ️  Nenhum SQLPOOL encontrado no resource_to_service — nada a processar para esta data")
+        return
+
+    logger.info(f"Pools encontrados: {len(pools)}")
+    for p in pools:
+        logger.info(f"  {p['ServiceKey']} | {p['Server']}/{p['Pool']}")
+
+    # ── Clientes por DB — da tag FINOPS-CLIENTE no resource_to_service ────
+    # Usa EffectiveFinopsCliente se disponível, senão FinopsClienteSource
+    cliente_col = next(
+        (c for c in ("EffectiveFinopsCliente", "FinopsCliente") if c in df_rts.columns),
+        None,
+    )
+
+    # ── Métricas e cálculo de share ────────────────────────────────────────
+    logger.info("\n== PROCESSANDO POOLS ==")
+    metrics_client = MetricsQueryClient(credential)
+
+    start_dt, end_dt = _build_day_window(usage_date)
+    cpu_pct_label  = int(CPU_WEIGHT * 100)
+    disk_pct_label = int(DISK_WEIGHT * 100)
+    notes_label    = f"CPU{cpu_pct_label}_DISK{disk_pct_label}"
+
+    all_detail: list[dict]   = []
+    all_share:  list[dict]   = []
+    all_diag:   list[dict]   = []
+
+    for pool in pools:
+        sub   = pool["SubscriptionId"]
+        rg    = pool["ResourceGroup"]
+        server = pool["Server"]
+        pool_name = pool["Pool"]
+        sk    = pool["ServiceKey"]
+
+        logger.info(f"\n{'='*60}")
+        logger.info(f"ServiceKey : {sk}")
+        logger.info(f"Pool       : {pool_name} | Server: {server}")
+        logger.info(f"Sub        : {sub}")
+
+        pool_daily_cost = daily_cost_by_sk.get(sk, 0.0)
+        logger.info(f"DailyCost  : {pool_daily_cost:.6f}")
+
+        if pool_daily_cost <= 0:
+            logger.warning(f"⚠ Sem custo para {sk} na data {usage_date}")
+            all_diag.append({
+                "ServiceKey": sk, "Status": "SKIPPED_NO_DAILY_COST",
+                "PoolDailyCost": 0, "DbCount": 0,
+                "TotalCpu": 0, "TotalDiskPct": 0, "TotalWeighted": 0,
+            })
+            continue
+
+        # Lista bancos no pool
+        db_names = _get_databases_in_pool(credential, sub, rg, server, pool_name)
+        logger.info(f"DBs no pool: {len(db_names)} → {db_names}")
+
+        if not db_names:
+            logger.warning(f"⚠ Nenhuma DB encontrada no pool {pool_name}")
+            all_diag.append({
+                "ServiceKey": sk, "Status": "SKIPPED_NO_DATABASES",
+                "PoolDailyCost": pool_daily_cost, "DbCount": 0,
+                "TotalCpu": 0, "TotalDiskPct": 0, "TotalWeighted": 0,
+            })
+            continue
+
+        # Coleta métricas por banco
+        detail_rows: list[dict] = []
+        for db in db_names:
+            db_rid = (
+                f"/subscriptions/{sub}/resourceGroups/{rg}"
+                f"/providers/Microsoft.Sql/servers/{server}/databases/{db}"
+            )
+
+            # Resolve cliente — busca no resource_to_service pelo DB ResourceId
+            cliente = "DEFINIR"
+            if cliente_col:
+                match = df_rts[
+                    df_rts["ResourceId"].astype(str).str.strip().str.lower()
+                    == db_rid.lower()
+                ]
+                if not match.empty:
+                    val = str(match.iloc[0].get(cliente_col, "") or "").strip().upper()
+                    if val and val not in ("COMPARTILHADO", "SEM TAG", ""):
+                        cliente = val
+
+            cpu_avg   = _get_metric_avg(metrics_client, db_rid, "cpu_percent",     start_dt, end_dt, 4)
+            disk_pct  = _get_metric_avg(metrics_client, db_rid, "storage_percent", start_dt, end_dt, 4)
+            disk_bytes = _get_metric_avg(metrics_client, db_rid, "storage",        start_dt, end_dt, 0)
+            disk_gb   = round(disk_bytes / (1024**3), 4)
+
+            logger.info(
+                f"  DB={db} | Cliente={cliente} | "
+                f"CPU={cpu_avg} | DiskPct={disk_pct} | DiskGB={disk_gb}"
+            )
+
+            detail_rows.append({
+                "UsageDate": usage_date, "ServiceKey": sk,
+                "Pool": pool_name, "SubscriptionId": sub,
+                "ResourceGroup": rg, "Server": server,
+                "Cliente": cliente, "Database": db, "ResourceId": db_rid,
+                "CpuAvgPct": cpu_avg, "DiskPercentAvg": disk_pct,
+                "DiskGBAvg": disk_gb,
+            })
+
+        if not detail_rows:
+            all_diag.append({
+                "ServiceKey": sk, "Status": "SKIPPED_NO_DETAIL",
+                "PoolDailyCost": pool_daily_cost, "DbCount": 0,
+                "TotalCpu": 0, "TotalDiskPct": 0, "TotalWeighted": 0,
+            })
+            continue
+
+        total_cpu  = sum(r["CpuAvgPct"]      for r in detail_rows)
+        total_disk = sum(r["DiskPercentAvg"] for r in detail_rows)
+        logger.info(f"TotalCpu={total_cpu:.4f} | TotalDisk={total_disk:.4f}")
+
+        # Calcula WeightedUsage por banco
+        for r in detail_rows:
+            contrib_cpu  = (r["CpuAvgPct"]      / total_cpu  * 100) if total_cpu  > 0 else 0.0
+            contrib_disk = (r["DiskPercentAvg"] / total_disk * 100) if total_disk > 0 else 0.0
+            weighted = (contrib_cpu * CPU_WEIGHT) + (contrib_disk * DISK_WEIGHT)
+            r["ContribCpuPct"]  = round(contrib_cpu, 4)
+            r["ContribDiskPct"] = round(contrib_disk, 4)
+            r["WeightedUsage"]  = round(weighted, 6)
+
+        total_weighted = sum(r["WeightedUsage"] for r in detail_rows)
+        logger.info(f"TotalWeighted={total_weighted:.6f}")
+
+        # Share — com fallback igual por DB se weighted = 0
+        fallback = False
+        if total_weighted <= 0:
+            logger.warning(f"⚠ TotalWeighted=0 → fallback igual por {len(detail_rows)} DBs")
+            fallback = True
+            equal_share = 1.0 / len(detail_rows)
+
+        for r in detail_rows:
+            if fallback:
+                share = equal_share
+                driver = "SQLPOOL_DB_COUNT_FALLBACK"
+                allocation_method = "SQL_ELASTIC_POOL_DB_COUNT"
+            else:
+                share = r["WeightedUsage"] / total_weighted
+                driver = "SQLPOOL_DB_METRICS"
+                allocation_method = "SQL_ELASTIC_POOL_CPU_DISK"
+
+            alloc_cost = pool_daily_cost * share
+
+            r["Share"]         = round(share, 6)
+            r["AllocatedCost"] = round(alloc_cost, 6)
+            r["PoolDailyCost"] = pool_daily_cost
+            r["DriverFallback"] = "DB_COUNT_EQUAL_SPLIT" if fallback else ""
+
+            all_detail.append(r)
+            all_share.append({
+                "Date":             usage_date,
+                "ServiceKey":       sk,
+                "Cliente":          r["Cliente"],
+                "Share":            round(share, 6),
+                "DriverType":       driver,
+                "AllocationMethod": allocation_method,
+            })
+
+        status = "PROCESSED_FALLBACK_DB_COUNT" if fallback else "PROCESSED_METRICS"
+        all_diag.append({
+            "ServiceKey": sk, "Status": status,
+            "PoolDailyCost": pool_daily_cost,
+            "DbCount": len(detail_rows),
+            "TotalCpu": total_cpu,
+            "TotalDiskPct": total_disk,
+            "TotalWeighted": total_weighted,
         })
+        logger.info(f"✅ {sk} — {len(detail_rows)} DBs processados")
 
-    share_sum = sum(r["Share"] for r in share_rows)
-    logger.info(
-        "✅ %s/%s → %d clientes | soma share=%.6f | custo=%.4f",
-        server, pool, len(share_rows), share_sum, pool_daily_cost,
-    )
-    return share_rows, detail_rows
-
-
-# ---------------------------------------------------------------------------
-# Step entry point
-# ---------------------------------------------------------------------------
-
-def run(pipeline_date: Optional[str] = None) -> None:
-    date_str = resolve_pipeline_date(pipeline_date)
-    logger.info("📅 s03c_sql_pool  date=%s", date_str)
-
-    store = pipeline_client()
-    partition = to_partition(date_str)
-
-    r2s = store.read_parquet(f"{_R2S_PREFIX}/{partition}/resource_to_service.parquet")
-
-    # Only non-dedicated SQL Elastic Pool resources — dedicated ones handled by s03a
-    mask = (
-        r2s["ResourceType"].str.lower().str.strip() == _ELASTIC_POOL_TYPE
-    ) & (
-        r2s["ServiceType"] != "dedicated"
-    )
-    sql_pool = r2s[mask].copy()
-    logger.info("📊 %d recursos Elastic Pool (não-dedicados) identificados", len(sql_pool))
-
-    if sql_pool.empty:
-        logger.info("ℹ️  Sem recursos SQL Elastic Pool — step ignorado")
+    if not all_detail:
+        logger.warning("⚠ Nenhum pool SQL processado com sucesso — pools encontrados mas sem DBs acessíveis")
         return
 
-    # Load fact_cost to get PoolDailyCost per ResourceId
-    fact_cost = store.read_parquet(f"{_FACT_COST_PREFIX}/{partition}/fact_cost.parquet")
-    cost_by_rid = (
-        fact_cost.groupby("ResourceId")["Cost"].sum().to_dict()
+    # ── Agrega shares por (Date, ServiceKey, Cliente) ──────────────────────
+    df_share_raw = pd.DataFrame(all_share)
+    df_share = (
+        df_share_raw
+        .groupby(["Date", "ServiceKey", "Cliente", "DriverType", "AllocationMethod"], as_index=False)
+        .agg(Share=("Share", "sum"))
     )
 
-    arm = _ArmClient()
-    all_share_rows: list[dict] = []
-    all_detail_rows: list[dict] = []
+    # Renormaliza por ServiceKey para garantir soma = 1.0
+    for sk_val, grp in df_share.groupby("ServiceKey"):
+        total = grp["Share"].sum()
+        if abs(total - 1.0) > 1e-6 and total > 0:
+            logger.info(f"  Renormalizando {sk_val}: soma={total:.8f}")
+            df_share.loc[grp.index, "Share"] = (grp["Share"] / total).round(6)
 
-    for _, row in sql_pool.drop_duplicates(subset=["ServiceKey"]).iterrows():
-        service_key = str(row["ServiceKey"])
-        resource_id = str(row["ResourceId"])
-        pool_daily_cost = float(cost_by_rid.get(resource_id, 0.0))
+    # ── Upload ─────────────────────────────────────────────────────────────
+    logger.info("\n== UPLOAD ==")
+    base = f"{OUT_PREFIX}/dt={usage_date}"
 
-        share_rows, detail_rows = _compute_pool_shares(
-            arm, service_key, resource_id, pool_daily_cost, date_str
-        )
-        all_share_rows.extend(share_rows)
-        all_detail_rows.extend(detail_rows)
+    df_detail_out = pd.DataFrame(all_detail)
+    # formata decimais
+    for col in ("CpuAvgPct", "DiskPercentAvg", "DiskGBAvg",
+                "ContribCpuPct", "ContribDiskPct", "WeightedUsage",
+                "Share", "AllocatedCost", "PoolDailyCost"):
+        if col in df_detail_out.columns:
+            df_detail_out[col] = df_detail_out[col].apply(_fmt6)
 
-    if not all_share_rows:
-        logger.warning("⚠ Nenhum share SQL Pool gerado — recursos cairão em client_weights no s05")
-        return
+    df_share["Share"] = df_share["Share"].apply(_fmt6)
 
-    df_shares = pd.DataFrame(all_share_rows, columns=_SHARE_COLUMNS)
-    df_detail = pd.DataFrame(all_detail_rows, columns=_DETAIL_COLUMNS)
-
-    store.write_csv(f"{_SQL_POOL_OUT_PREFIX}/{partition}/sql_pool.csv", df_shares)
-    store.write_csv(f"{_SQL_POOL_OUT_PREFIX}/{partition}/sqlpool_detail_all.csv", df_detail)
-
-    logger.info(
-        "✅ sql_pool: %d shares, %d linhas detalhe → %s",
-        len(df_shares), len(df_detail), f"{_SQL_POOL_OUT_PREFIX}/{partition}/",
+    upload_csv(
+        df_detail_out,
+        PIPELINE_STORAGE_ACCOUNT, PIPELINE_CONTAINER,
+        f"{base}/sqlpool_detail_all_{usage_date}.csv",
     )
+    upload_csv(
+        df_share,
+        PIPELINE_STORAGE_ACCOUNT, PIPELINE_CONTAINER,
+        f"{base}/sqlpool_allocation_share_all_{usage_date}.csv",
+    )
+
+    # ── Resumo ─────────────────────────────────────────────────────────────
+    logger.info("\n== RESUMO ==")
+    df_diag = pd.DataFrame(all_diag)
+    for status, grp in df_diag.groupby("Status"):
+        logger.info(f"  {status}: {len(grp)} pool(s)")
+    logger.info(f"  Total share rows: {len(df_share)}")
+    logger.info(f"\n✅ s03c_sql_pool concluído")

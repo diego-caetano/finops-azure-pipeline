@@ -9,6 +9,7 @@ Dois clients:
 import io
 import logging
 import os
+import re
 import time
 
 import pandas as pd
@@ -131,5 +132,57 @@ def upload_parquet(
         buf.seek(0)
         svc.get_blob_client(container=container, blob=blob_path).upload_blob(buf, overwrite=True)
         logger.info("⬆️  %s/%s/%s (%d linhas)", storage_account, container, blob_path, len(df))
+
+    _retry(_do)
+
+
+def download_csv_with_fallback(
+    account: str,
+    container: str,
+    prefix: str,
+    date: str,
+    pattern: str,
+) -> tuple[pd.DataFrame, str, str]:
+    """List {prefix}/dt={date}/, return first blob matching pattern as CSV.
+
+    Falls back to any .parquet in the same folder if no CSV match is found.
+    Returns (df, blob_path, file_type) where file_type is "csv", "parquet", or "empty".
+    """
+    store = StorageClient(account, container)
+    partition_prefix = f"{prefix}/dt={date}/"
+    blobs = store.list_blobs(partition_prefix)
+
+    csv_match = next(
+        (b for b in blobs if re.search(pattern, b.split("/")[-1], re.IGNORECASE)),
+        None,
+    )
+    if csv_match:
+        return store.read_csv(csv_match), csv_match, "csv"
+
+    parquet_match = next((b for b in blobs if b.endswith(".parquet")), None)
+    if parquet_match:
+        return store.read_parquet(parquet_match), parquet_match, "parquet"
+
+    logger.warning("⚠ Nenhum arquivo encontrado em %s/%s/%s", account, container, partition_prefix)
+    return pd.DataFrame(), "", "empty"
+
+
+def upload_csv(
+    df: pd.DataFrame,
+    storage_account: str,
+    container: str,
+    blob_path: str,
+) -> None:
+    """Faz upload de um DataFrame como CSV (sep=';', UTF-8, float 6 decimais) para o Blob Storage."""
+    svc = _service_client(storage_account)
+
+    def _do():
+        buf = io.StringIO()
+        df.to_csv(buf, sep=";", index=False, encoding="utf-8", float_format="%.6f")
+        data = buf.getvalue().encode("utf-8")
+        svc.get_blob_client(container=container, blob=blob_path).upload_blob(
+            io.BytesIO(data), overwrite=True, length=len(data)
+        )
+        logger.info("⬆️  %s/%s/%s (%d bytes)", storage_account, container, blob_path, len(data))
 
     _retry(_do)
