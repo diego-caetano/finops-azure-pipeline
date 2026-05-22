@@ -159,10 +159,11 @@ def _get_databases_in_pool(
     resource_group: str,
     server: str,
     pool: str,
-) -> list[str]:
+) -> list[dict]:
     """
-    Lista os bancos de dados pertencentes a um elastic pool.
-    Equivalente a Get-DbNamesInPool do PS.
+    Lista bancos de dados do pool com tag FINOPS-CLIENTE lida diretamente do ARM.
+    Retorna list[{"name": str, "finops_cliente": str | None}].
+    Tags são lidas do objeto db.tags (case-insensitive) — não requer $expand separado.
     """
     try:
         sql_client = SqlManagementClient(credential, subscription_id)
@@ -170,8 +171,11 @@ def _get_databases_in_pool(
         result = []
         for db in dbs:
             if db.elastic_pool_id and pool.lower() in db.elastic_pool_id.lower():
-                result.append(db.name)
-        return sorted(set(result))
+                tags = db.tags or {}
+                tag_key = next((k for k in tags if k.lower() == "finops-cliente"), None)
+                finops_cliente = tags[tag_key].strip().upper() if tag_key else None
+                result.append({"name": db.name, "finops_cliente": finops_cliente})
+        return sorted(result, key=lambda d: d["name"])
     except Exception as exc:
         logger.warning(
             f"⚠ Erro ao listar DBs do pool {pool} em {server}: {exc}"
@@ -253,9 +257,9 @@ def run(pipeline_date: str | None = None) -> None:
     pools_seen: set[str] = set()
     pools: list[dict] = []
 
+    # Filtra por ServiceKey=SQLPOOL: (definido em s02 para elastic pools, display name ou ARM format)
     sql_rows = df_rts[
         df_rts["ServiceKey"].astype(str).str.upper().str.startswith("SQLPOOL:")
-        & (df_rts["ResourceType"].astype(str).str.lower() == "microsoft.sql/servers/elasticpools")
     ]
 
     for _, row in sql_rows.iterrows():
@@ -322,9 +326,14 @@ def run(pipeline_date: str | None = None) -> None:
             })
             continue
 
-        # Lista bancos no pool
+        # Lista bancos no pool com tags ARM
         db_names = _get_databases_in_pool(credential, sub, rg, server, pool_name)
-        logger.info(f"DBs no pool: {len(db_names)} → {db_names}")
+        logger.info(f"DBs no pool: {len(db_names)}")
+        for db_info in db_names:
+            logger.info(
+                "  🔍 Database: %s | Tag FINOPS-CLIENTE: %s",
+                db_info["name"], db_info["finops_cliente"] or "AUSENTE",
+            )
 
         if not db_names:
             logger.warning(f"⚠ Nenhuma DB encontrada no pool {pool_name}")
@@ -337,15 +346,20 @@ def run(pipeline_date: str | None = None) -> None:
 
         # Coleta métricas por banco
         detail_rows: list[dict] = []
-        for db in db_names:
+        for db_info in db_names:
+            db = db_info["name"]
             db_rid = (
                 f"/subscriptions/{sub}/resourceGroups/{rg}"
                 f"/providers/Microsoft.Sql/servers/{server}/databases/{db}"
             )
 
-            # Resolve cliente — busca no resource_to_service pelo DB ResourceId
+            # 1ª opção: tag FINOPS-CLIENTE lida do ARM (case-insensitive, já normalizada)
+            # 2ª opção: fallback via resource_to_service (databases raramente aparecem no FOCUS)
             cliente = "DEFINIR"
-            if cliente_col:
+            finops_tag = db_info.get("finops_cliente")
+            if finops_tag and finops_tag not in ("COMPARTILHADO", "SEM TAG", ""):
+                cliente = finops_tag
+            elif cliente_col:
                 match = df_rts[
                     df_rts["ResourceId"].astype(str).str.strip().str.lower()
                     == db_rid.lower()
@@ -355,14 +369,14 @@ def run(pipeline_date: str | None = None) -> None:
                     if val and val not in ("COMPARTILHADO", "SEM TAG", ""):
                         cliente = val
 
-            cpu_avg   = _get_metric_avg(metrics_client, db_rid, "cpu_percent",     start_dt, end_dt, 4)
-            disk_pct  = _get_metric_avg(metrics_client, db_rid, "storage_percent", start_dt, end_dt, 4)
-            disk_bytes = _get_metric_avg(metrics_client, db_rid, "storage",        start_dt, end_dt, 0)
-            disk_gb   = round(disk_bytes / (1024**3), 4)
+            cpu_avg    = _get_metric_avg(metrics_client, db_rid, "cpu_percent",     start_dt, end_dt, 4)
+            disk_pct   = _get_metric_avg(metrics_client, db_rid, "storage_percent", start_dt, end_dt, 4)
+            disk_bytes = _get_metric_avg(metrics_client, db_rid, "storage",         start_dt, end_dt, 0)
+            disk_gb    = round(disk_bytes / (1024**3), 4)
 
             logger.info(
-                f"  DB={db} | Cliente={cliente} | "
-                f"CPU={cpu_avg} | DiskPct={disk_pct} | DiskGB={disk_gb}"
+                "  DB=%s | Cliente=%s | CPU=%.4f | DiskPct=%.4f | DiskGB=%.4f",
+                db, cliente, cpu_avg, disk_pct, disk_gb,
             )
 
             detail_rows.append({
@@ -409,11 +423,11 @@ def run(pipeline_date: str | None = None) -> None:
             if fallback:
                 share = equal_share
                 driver = "SQLPOOL_DB_COUNT_FALLBACK"
-                allocation_method = "SQL_ELASTIC_POOL_DB_COUNT"
+                allocation_method = "SQLPOOL_DB_COUNT"
             else:
                 share = r["WeightedUsage"] / total_weighted
                 driver = "SQLPOOL_DB_METRICS"
-                allocation_method = "SQL_ELASTIC_POOL_CPU_DISK"
+                allocation_method = "SQLPOOL_CPU"
 
             alloc_cost = pool_daily_cost * share
 

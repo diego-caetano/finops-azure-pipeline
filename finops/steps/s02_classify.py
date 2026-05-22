@@ -191,7 +191,11 @@ def run(pipeline_date: Optional[str] = None) -> None:
     )
 
     # ── SQL Elastic Pool override: SQLPOOL:{pool_name} ────────────────────
-    is_elasticpool = df["ResourceType"].str.lower() == "microsoft.sql/servers/elasticpools"
+    # FOCUS usa display name "SQL elastic pool"; ARM usa "microsoft.sql/servers/elasticpools"
+    is_elasticpool = df["ResourceType"].str.lower().isin([
+        "microsoft.sql/servers/elasticpools",
+        "sql elastic pool",
+    ])
     if is_elasticpool.any():
         pool_name_extracted = rid.str.extract(r"/elasticPools/([^/]+)$", flags=re.IGNORECASE)[0]
         valid_pool = is_elasticpool & pool_name_extracted.notna()
