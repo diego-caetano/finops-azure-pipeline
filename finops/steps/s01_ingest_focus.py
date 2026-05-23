@@ -180,6 +180,15 @@ def run(pipeline_date: Optional[str] = None) -> None:
         return
 
     df = pd.concat(frames, ignore_index=True)
+
+    # ChargeCategory=Purchase: Reservation orders sem ResourceGroup — incluídos intencionalmente.
+    # No enrollment KMM, BilledCost das linhas Purchase representa custo real de RI
+    # que NÃO está amortizado nas linhas Usage (confirmado: total com Purchase ≈ R$ 430k/mês esperado;
+    # filtrar Purchase reduzia incorretamente para ~R$ 365k/mês). Vão para WEIGHT_PROPORTIONAL no s05.
+    if "ChargeCategory" in df.columns:
+        cc_counts = df["ChargeCategory"].value_counts().to_dict()
+        logger.info("📋 ChargeCategory distribuição: %s", cc_counts)
+
     cols = list(df.columns)
 
     # 4. Map columns to fact_cost schema

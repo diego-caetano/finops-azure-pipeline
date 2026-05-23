@@ -337,7 +337,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `finops/utils/logging.py`
 - [x] `finops/storage.py` — dois storage accounts; `download_csv_with_fallback()`, `upload_parquet()`, `upload_csv()`
 - [x] `finops/steps/s00_sync_rg_tags.py`
-- [x] `finops/steps/s01_ingest_focus.py` — inclui filtro `BILLING_SUBSCRIPTION_IDS` com normalização de prefixo ARM; filtra `ChargeCategory=Usage` (remove Purchase/RI orders sem ResourceGroup — custo RI já amortizado em BilledCost das linhas Usage)
+- [x] `finops/steps/s01_ingest_focus.py` — inclui filtro `BILLING_SUBSCRIPTION_IDS` com normalização de prefixo ARM; loga distribuição `ChargeCategory` (Purchase mantido — custo RI real, vai para WEIGHT_PROPORTIONAL no s05)
 - [x] `finops/steps/s02_classify.py` — hierarquia 6 regras, MC_ pattern, Tags JSON, vetorizado com np.select; elastic pools recebem `ServiceKey=SQLPOOL:{pool_name}` e `ServiceType=sql_pool`
 - [x] `finops/steps/s03a_dedicated.py` — Share=1.0 por recurso dedicado
 - [x] `finops/steps/s03b_aks.py` — AKS via OpenCost
@@ -471,7 +471,7 @@ Retrocarga corretiva 2026-05-15 a 2026-05-20 executada em 2026-05-22 (6/6 OK):
 
 ### Qualidade de dados (melhorias incrementais)
 - [ ] Taguear databases SQL Elastic Pool com `FINOPS-CLIENTE` → s03c mapeia database → cliente pela tag; sem tag, database entra como `COMPARTILHADO` no rateio proporcional e é registrado em `databases_sem_tag_{date}.csv`
-- [x] ~~Reserved Instances de VMs AKS~~ — resolvido via filtro `ChargeCategory=Usage` no s01 (2026-05-22). O FOCUS KMM já traz `BilledCost == EffectiveCost` (custo amortizado embutido nas linhas de Usage). Linhas `ChargeCategory=Purchase` (Reservation order sem RG) são descartadas no s01 antes de chegar ao s02. Arquivo `ri_cluster_map.csv` não necessário.
+- [ ] Reserved Instances de VMs AKS — `ChargeCategory=Purchase` (Reservation orders sem RG) é mantido no pipeline e vai para WEIGHT_PROPORTIONAL. No enrollment KMM, o custo de RI NÃO está amortizado nas linhas Usage (BilledCost Purchase é custo real separado — total com Purchase ≈ R$ 430k/mês; sem Purchase cai para ~R$ 365k). Se quiser mapear RI para cluster específico, criar `ri_cluster_map.csv`.
 - [ ] Corrigir tags numéricas (`FINOPS-CLIENTE=267`, `8`, `35`...) no portal Azure
 
 ### Relatórios / Power BI
