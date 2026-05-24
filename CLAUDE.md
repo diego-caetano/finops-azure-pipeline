@@ -369,7 +369,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `config/reference/clientes_alias.csv`
 
 ### Infraestrutura provisionada
-- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (2026-05-22 22:50 UTC; inclui s01 ChargeCategory filter + s03c COMPARTILHADO + s06 threshold 0.05 + retro_fix.py logging fix)
+- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (2026-05-23 19:44 UTC; inclui s03c COMPARTILHADO + s06 threshold 0.05 + retro_fix.py logging fix + log ChargeCategory distribuição)
 - [x] Container `finops-v2` criado em `stpslkmmfinopseusprd`
 
 ### Clusters AKS — todos os 5 com OpenCost operacionais ✅
@@ -402,19 +402,21 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 
 ---
 
-## Validação do pipeline (2026-05-22)
+## Validação do pipeline (2026-05-24)
 
 Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 
 | Métrica | Valor |
 |---|---|
 | Escopo | `52d4423b` (KMM PRD) + `3f6d197f` (KMM DEV-TEST) |
-| TotalAllocated | **100,0%** |
-| Custo médio diário | ~R$ 14.370/dia (22 dias, dados settlados) |
-| Total maio acumulado | R$ 316.135 (22 dias — 2026-05-22 parcial, D-3) |
+| TotalAllocated | **100,0%** (todas as 22 datas) |
+| Custo médio diário | ~R$ 14.730/dia (22 dias, dados settlados) |
+| Total maio acumulado | R$ 324.070 (22 dias — 2026-05-22 parcial, D-3) |
+| Projeção maio completo | ~R$ 456k (alinhado ao esperado ~R$ 430k) |
 | Método predominante | WEIGHT_PROPORTIONAL + DEDICATED_TAG + AKS_OPENCOST |
 | AKS_OPENCOST | 0% — VMs AKS aparecem como Reserved Instances no FOCUS, sem vínculo direto com cluster |
-| SQLPOOL | Ativo — pools com `ServiceKey=SQLPOOL:{pool_name}`; s03c faz skip gracioso em dias sem pools no FOCUS |
+| SQLPOOL | Ativo — 4 pools processados por data; 18 databases sem tag → COMPARTILHADO |
+| ChargeCategory | Usage + Purchase incluídos — Purchase = custo real de RI no enrollment KMM |
 
 5 outputs do s06 por data em `gold/fact_allocated_cost/dt=<data>/`:
 - `fact_allocated_cost_<data>.parquet`
@@ -423,12 +425,12 @@ Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 - `reconciliation_<data>.csv`
 - `unallocated_cost_<data>.csv`
 
-Consolidado Power BI (s07) — atualizado em 2026-05-22 (retrocarga completa de maio):
-- `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet`: **1 336 822 linhas**, 22 datas (2026-05-01 a 2026-05-22)
+Consolidado Power BI (s07) — atualizado em 2026-05-24 (retrocarga completa de maio):
+- `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet`: **1.374.343 linhas**, 22 datas (2026-05-01 a 2026-05-22)
 - `gold/fact_allocated_cost_consolidated/manifest.csv`: 22 entradas, todas `Status=OK`
-- `TotalCost` no manifest corrigido: lido de `reconciliation_<data>.csv` (sem duplicação do fan-out)
+- `TotalCost` no manifest lido de `reconciliation_<data>.csv` (sem duplicação do fan-out)
 - Linhas no consolidado == soma exata do manifest ✅
-- Total alocado maio (22 dias): **R$ 316.135** | média diária: **~R$ 14.370**
+- Total alocado maio (22 dias): **R$ 324.070** | média diária: **~R$ 14.730**
 
 ### FOCUS_LAG_DAYS = 3 — estratégia D-3 + retro semanal
 
