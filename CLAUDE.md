@@ -337,7 +337,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `finops/utils/logging.py`
 - [x] `finops/storage.py` — dois storage accounts; `download_csv_with_fallback()`, `upload_parquet()`, `upload_csv()`
 - [x] `finops/steps/s00_sync_rg_tags.py`
-- [x] `finops/steps/s01_ingest_focus.py` — inclui filtro `BILLING_SUBSCRIPTION_IDS` com normalização de prefixo ARM; loga distribuição `ChargeCategory` (Purchase mantido — custo RI real, vai para WEIGHT_PROPORTIONAL no s05)
+- [x] `finops/steps/s01_ingest_focus.py` — inclui filtro `BILLING_SUBSCRIPTION_IDS` com normalização de prefixo ARM; usa `EffectiveCost` em vez de `BilledCost` (RI amortizada embutida nas linhas Usage com RG correto); filtra `EffectiveCost>0` (remove Purchase/RI sem consumo)
 - [x] `finops/steps/s02_classify.py` — hierarquia 6 regras, MC_ pattern, Tags JSON, vetorizado com np.select; elastic pools recebem `ServiceKey=SQLPOOL:{pool_name}` e `ServiceType=sql_pool`
 - [x] `finops/steps/s03a_dedicated.py` — Share=1.0 por recurso dedicado
 - [x] `finops/steps/s03b_aks.py` — AKS via OpenCost
@@ -369,7 +369,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `config/reference/clientes_alias.csv`
 
 ### Infraestrutura provisionada
-- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (2026-05-23 19:44 UTC; inclui s03c COMPARTILHADO + s06 threshold 0.05 + retro_fix.py logging fix + log ChargeCategory distribuição)
+- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (2026-05-24; inclui s01 EffectiveCost + s03c COMPARTILHADO + s06 threshold 0.05)
 - [x] Container `finops-v2` criado em `stpslkmmfinopseusprd`
 
 ### Clusters AKS — todos os 5 com OpenCost operacionais ✅
@@ -414,9 +414,9 @@ Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 | Total maio acumulado | R$ 324.070 (22 dias — 2026-05-22 parcial, D-3) |
 | Projeção maio completo | ~R$ 456k (alinhado ao esperado ~R$ 430k) |
 | Método predominante | WEIGHT_PROPORTIONAL + DEDICATED_TAG + AKS_OPENCOST |
-| AKS_OPENCOST | 0% — VMs AKS aparecem como Reserved Instances no FOCUS, sem vínculo direto com cluster |
+| AKS_OPENCOST | Ativo — custo RI amortizado via EffectiveCost aparece nos RGs MC_* com RG correto |
 | SQLPOOL | Ativo — 4 pools processados por data; 18 databases sem tag → COMPARTILHADO |
-| ChargeCategory | Usage + Purchase incluídos — Purchase = custo real de RI no enrollment KMM |
+| EffectiveCost | Usado em vez de BilledCost — RI amortizada embutida nas linhas Usage; Purchase (EffectiveCost=0) filtrado |
 
 5 outputs do s06 por data em `gold/fact_allocated_cost/dt=<data>/`:
 - `fact_allocated_cost_<data>.parquet`
@@ -473,7 +473,7 @@ Retrocarga corretiva 2026-05-15 a 2026-05-20 executada em 2026-05-22 (6/6 OK):
 
 ### Qualidade de dados (melhorias incrementais)
 - [ ] Taguear databases SQL Elastic Pool com `FINOPS-CLIENTE` → s03c mapeia database → cliente pela tag; sem tag, database entra como `COMPARTILHADO` no rateio proporcional e é registrado em `databases_sem_tag_{date}.csv`
-- [ ] Reserved Instances de VMs AKS — `ChargeCategory=Purchase` (Reservation orders sem RG) é mantido no pipeline e vai para WEIGHT_PROPORTIONAL. No enrollment KMM, o custo de RI NÃO está amortizado nas linhas Usage (BilledCost Purchase é custo real separado — total com Purchase ≈ R$ 430k/mês; sem Purchase cai para ~R$ 365k). Se quiser mapear RI para cluster específico, criar `ri_cluster_map.csv`.
+- [x] ~~Reserved Instances de VMs AKS~~ — resolvido via `EffectiveCost` no s01 (2026-05-24). EffectiveCost distribui o custo de RI de volta para os recursos com RG correto (incluindo MC_* dos clusters AKS). Purchase lines (EffectiveCost=0) removidas pelo filtro `EffectiveCost>0`. Arquivo `ri_cluster_map.csv` não necessário.
 - [ ] Corrigir tags numéricas (`FINOPS-CLIENTE=267`, `8`, `35`...) no portal Azure
 
 ### Relatórios / Power BI

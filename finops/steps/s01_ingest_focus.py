@@ -49,7 +49,7 @@ _COLUMN_CANDIDATES: dict[str, list[str]] = {
     "ResourceType":      ["ResourceType"],
     "SubscriptionId":    ["SubAccountId", "SubscriptionId", "x_SubscriptionId"],
     "ServiceName":       ["ServiceName"],
-    "Cost":              ["BilledCost"],
+    "Cost":              ["EffectiveCost"],
     "Tags":              ["Tags", "tags"],
 }
 
@@ -181,13 +181,18 @@ def run(pipeline_date: Optional[str] = None) -> None:
 
     df = pd.concat(frames, ignore_index=True)
 
-    # ChargeCategory=Purchase: Reservation orders sem ResourceGroup — incluídos intencionalmente.
-    # No enrollment KMM, BilledCost das linhas Purchase representa custo real de RI
-    # que NÃO está amortizado nas linhas Usage (confirmado: total com Purchase ≈ R$ 430k/mês esperado;
-    # filtrar Purchase reduzia incorretamente para ~R$ 365k/mês). Vão para WEIGHT_PROPORTIONAL no s05.
-    if "ChargeCategory" in df.columns:
-        cc_counts = df["ChargeCategory"].value_counts().to_dict()
-        logger.info("📋 ChargeCategory distribuição: %s", cc_counts)
+    # Usa EffectiveCost (custo amortizado) em vez de BilledCost.
+    # BilledCost=0 nas linhas de Usage cobertas por RI — o custo real está em EffectiveCost,
+    # distribuído de volta para os recursos com ResourceGroup correto (incluindo MC_* dos clusters AKS).
+    # Purchase lines (Reservation order sem RG) ficam com EffectiveCost=0 e são removidas abaixo.
+    if "BilledCost" in df.columns and "EffectiveCost" in df.columns:
+        billed_total    = df["BilledCost"].sum()
+        effective_total = df["EffectiveCost"].sum()
+        logger.info(
+            "💰 BilledCost total: %.2f | EffectiveCost total: %.2f | "
+            "Diferença (RI amortizada): %.2f",
+            billed_total, effective_total, effective_total - billed_total,
+        )
 
     cols = list(df.columns)
 
@@ -234,7 +239,15 @@ def run(pipeline_date: Optional[str] = None) -> None:
 
     df_out = df_out[available].copy()
     df_out["Cost"] = pd.to_numeric(df_out["Cost"], errors="coerce").fillna(0.0)
-    df_out = df_out[df_out["Cost"] != 0].reset_index(drop=True)
+    n_before = len(df_out)
+    df_out = df_out[df_out["Cost"] > 0].reset_index(drop=True)
+    n_zero = n_before - len(df_out)
+    if n_zero:
+        logger.info(
+            "🔍 Filtro EffectiveCost>0: removidas %d linhas (%.1f%%) "
+            "— Purchase/RI sem consumo",
+            n_zero, n_zero / n_before * 100,
+        )
 
     logger.info("✅ fact_cost: %d linhas, custo total=%.2f", len(df_out), df_out["Cost"].sum())
 
