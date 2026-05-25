@@ -351,7 +351,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `jobs/run_pipeline.py` — s07 integrado como último step
 - [x] `sh/retro_may.py` — retrocarga original 2026-05-01 a 2026-05-15
 - [x] `sh/retro_fix_may15_20.py` — retrocarga corretiva pontual (obsoleto; substituído por retro_fix.py)
-- [x] `sh/retro_fix.py` — retrocarga corretiva genérica; aceita `--start`/`--end` ou padrão de 7 dias; compara antes/depois; executa steps Python diretamente (funciona local e como CronJob)
+- [x] `sh/retro_fix.py` — retrocarga corretiva genérica; aceita `--start`/`--end` ou env vars `RETRO_START`/`RETRO_END` (compatível com Kubernetes Job); compara antes/depois; executa s01→s06 por data e faz consolidação PBI em **lote único ao final** (1 download + 1 upload do consolidado, em vez de N×download+upload); `_read_manifest_antes` e `_read_total_fact_cost` criam `pipeline_client()` fresco (evita token stale)
 - [x] `sh/build_consolidated.py` — percorre todos os parquets em `gold/fact_allocated_cost/` e chama s07 por data
 - [x] `requirements.txt` — `azure-monitor-query==1.3.0`, `azure-mgmt-sql>=3.0.0`
 
@@ -361,6 +361,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `k8s/cronjob-pipeline.yaml` — inclui `BILLING_SUBSCRIPTION_IDS` no ConfigMap
 - [x] `k8s/job-fix-consolidated.yaml` — job avulso para re-executar build_consolidated (corretivo/retroativo)
 - [x] `k8s/cronjob-retro-fix.yaml` — CronJob semanal (toda 2ª-feira 07:00 UTC) que executa `sh/retro_fix.py` (últimos 7 dias)
+- [x] `k8s/job-retro.yaml` — Job one-shot para retrocarga manual com intervalo customizado via `RETRO_START`/`RETRO_END`
 - [x] `Dockerfile` — inclui `COPY sh/ ./sh/` para expor build_consolidated.py nos pods
 - [x] `requirements.txt`
 
@@ -369,7 +370,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `config/reference/clientes_alias.csv`
 
 ### Infraestrutura provisionada
-- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (2026-05-24; inclui s01 EffectiveCost + s03c COMPARTILHADO + s06 threshold 0.05)
+- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (cq10, 2026-05-25; inclui s01 EffectiveCost + s03c COMPARTILHADO + s06 threshold 0.05 + s02 rule4_wins fix + retro_fix batch consolidation)
 - [x] Container `finops-v2` criado em `stpslkmmfinopseusprd`
 
 ### Clusters AKS — todos os 5 com OpenCost operacionais ✅
@@ -402,20 +403,20 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 
 ---
 
-## Validação do pipeline (2026-05-24)
+## Validação do pipeline (2026-05-25)
 
 Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 
 | Métrica | Valor |
 |---|---|
 | Escopo | `52d4423b` (KMM PRD) + `3f6d197f` (KMM DEV-TEST) |
-| TotalAllocated | **100,0%** (todas as 22 datas) |
-| Custo médio diário | ~R$ 14.730/dia (22 dias, dados settlados) |
-| Total maio acumulado | R$ 324.070 (22 dias — 2026-05-22 parcial, D-3) |
-| Projeção maio completo | ~R$ 456k (alinhado ao esperado ~R$ 430k) |
+| TotalAllocated | **100,0%** (todas as 24 datas) |
+| Custo médio diário | ~R$ 13.400–15.200/dia (dados settlados, varia por dia) |
+| Total maio (24 datas, 01–24) | **R$ 336.659** | média diária: **~R$ 14.027** |
+| Projeção maio completo | ~R$ 434k (alinhado ao esperado ~R$ 430k) |
 | Método predominante | WEIGHT_PROPORTIONAL + DEDICATED_TAG + AKS_OPENCOST |
-| AKS_OPENCOST | Ativo — custo RI amortizado via EffectiveCost aparece nos RGs MC_* com RG correto |
-| SQLPOOL | Ativo — 4 pools processados por data; 18 databases sem tag → COMPARTILHADO |
+| AKS_OPENCOST | Ativo — R$ ~1.500/dia via consumo real de namespace (fix 2026-05-25: `rule4_wins` corrigido em s02) |
+| SQLPOOL | Ativo — 7 pools processados; databases taggeados (tagging concluído 2026-05-24) |
 | EffectiveCost | Usado em vez de BilledCost — RI amortizada embutida nas linhas Usage; Purchase (EffectiveCost=0) filtrado |
 
 5 outputs do s06 por data em `gold/fact_allocated_cost/dt=<data>/`:
@@ -425,12 +426,13 @@ Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 - `reconciliation_<data>.csv`
 - `unallocated_cost_<data>.csv`
 
-Consolidado Power BI (s07) — atualizado em 2026-05-24 (retrocarga completa de maio):
-- `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet`: **1.374.343 linhas**, 22 datas (2026-05-01 a 2026-05-22)
-- `gold/fact_allocated_cost_consolidated/manifest.csv`: 22 entradas, todas `Status=OK`
+Consolidado Power BI — atualizado em 2026-05-25 (retrocarga completa pós-fix AKS_OPENCOST):
+- `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet`: **1.621.537 linhas**, 24 datas (2026-05-01 a 2026-05-24), Status=OK
+- Retrocarga 2026-05-01 a 2026-05-24: **24/24 ✅** — AKS_OPENCOST ativo + databases SQL taggeados
 - `TotalCost` no manifest lido de `reconciliation_<data>.csv` (sem duplicação do fan-out)
-- Linhas no consolidado == soma exata do manifest ✅
-- Total alocado maio (22 dias): **R$ 324.070** | média diária: **~R$ 14.730**
+- Total maio (24 datas): **R$ 336.659** | média diária: **R$ 14.027**
+- Consolidação feita em lote único (`_rebuild_consolidated_batch`) — 1 download + 1 upload do consolidado
+- 2026-05-24 mostrou +174,5% vs antes: estava com D+1 parcial no FOCUS anterior (normal — será reprocessado pelo CronJob retro-fix semanal)
 
 ### FOCUS_LAG_DAYS = 3 — estratégia D-3 + retro semanal
 
@@ -471,13 +473,28 @@ Retrocarga corretiva 2026-05-15 a 2026-05-20 executada em 2026-05-22 (6/6 OK):
 - [ ] aks-prd-emissor — migrar para OpenCost, depois seguir fluxo de identidade
 - [ ] aks-mg-kmm-win-eus-hml — instalar OpenCost, depois seguir fluxo de identidade
 
+### ~~BUG CRÍTICO — AKS_OPENCOST = R$ 0~~ — RESOLVIDO (2026-05-25) ✅
+
+**Causa raiz identificada e corrigida:** `s02_classify.py` linha 187 — `rule4_wins` tinha `& ~cond3` que bloqueava OVERRIDE_RG_AUTO quando MC_* RGs tinham tag COMPARTILHADO no rg_tags.csv.
+
+**Fix aplicado:** removido `& ~cond3` da condição `rule4_wins`. OVERRIDE_RG_AUTO agora tem prioridade sobre TAG_RG_SHARED para RGs MC_*.
+Nota: `Rule` no r2s ainda mostra `TAG_RG_SHARED` (np.select não foi alterado), mas `ServiceKey=AKS:{cluster}` está correto — s06 usa ServiceKey para o join, não Rule.
+
+**Validação em 2026-05-22:**
+- AKS_OPENCOST: R$ 1.503,50 (era R$ 0) — 12.575 linhas, 4 clusters
+- WEIGHT_PROPORTIONAL: R$ 1.986 (reduziu conforme esperado)
+- TotalAllocated: 100% mantido
+
+**Imagem publicada:** `registrykmm.azurecr.io/finops-pipeline:latest` (build cq10, 2026-05-25)
+**Retrocarga 2026-05-01 a 2026-05-24 concluída (24/24 ✅, 2026-05-25)** — consolidado atualizado com AKS_OPENCOST ativo.
+
 ### Qualidade de dados (melhorias incrementais)
-- [ ] Taguear databases SQL Elastic Pool com `FINOPS-CLIENTE` → s03c mapeia database → cliente pela tag; sem tag, database entra como `COMPARTILHADO` no rateio proporcional e é registrado em `databases_sem_tag_{date}.csv`
+- [x] ~~Taguear databases SQL Elastic Pool com `FINOPS-CLIENTE`~~ — concluído (2026-05-24); s03c mapeia database → cliente pela tag; `databases_sem_tag_{date}.csv` deve estar vazio ou com resíduos mínimos
 - [x] ~~Reserved Instances de VMs AKS~~ — resolvido via `EffectiveCost` no s01 (2026-05-24). EffectiveCost distribui o custo de RI de volta para os recursos com RG correto (incluindo MC_* dos clusters AKS). Purchase lines (EffectiveCost=0) removidas pelo filtro `EffectiveCost>0`. Arquivo `ri_cluster_map.csv` não necessário.
-- [ ] Corrigir tags numéricas (`FINOPS-CLIENTE=267`, `8`, `35`...) no portal Azure
+- [x] ~~Tags numéricas~~ — investigado em 2026-05-25; zero ocorrências no consolidado de maio (1.621.537 linhas). Não confirmado nos dados reais — item encerrado.
 
 ### Relatórios / Power BI
-- [x] Criar arquivo consolidado `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet` — 1 336 822 linhas, 22 datas (2026-05-01 a 2026-05-22) ✅
+- [x] Criar arquivo consolidado `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet` — **1.621.537 linhas**, 24 datas (2026-05-01 a 2026-05-24) ✅
 - [x] manifest.csv com status por data — TotalCost corrigido (sem inflação do fan-out) ✅
 - [ ] Power BI — conectar direto no Blob Storage (`finops-v2`) via Azure Storage connector e apontar para o consolidado
 - [x] **Pipeline processa D-3** — `FOCUS_LAG_DAYS=3` em `finops/utils/dates.py`; log: `📅 Pipeline date: YYYY-MM-DD (D-3, FOCUS lag=3 dias)` ✅
