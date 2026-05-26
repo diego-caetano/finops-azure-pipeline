@@ -340,11 +340,11 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `finops/steps/s01_ingest_focus.py` — inclui filtro `BILLING_SUBSCRIPTION_IDS` com normalização de prefixo ARM; usa `EffectiveCost` em vez de `BilledCost` (RI amortizada embutida nas linhas Usage com RG correto); filtra `EffectiveCost>0` (remove Purchase/RI sem consumo)
 - [x] `finops/steps/s02_classify.py` — hierarquia 6 regras, MC_ pattern, Tags JSON, vetorizado com np.select; elastic pools recebem `ServiceKey=SQLPOOL:{pool_name}` e `ServiceType=sql_pool`
 - [x] `finops/steps/s03a_dedicated.py` — Share=1.0 por recurso dedicado
-- [x] `finops/steps/s03b_aks.py` — AKS via OpenCost
-- [x] `finops/steps/s03c_sql_pool.py` — SQL Elastic Pools: ARM API + Monitor CPU; `AllocationMethod` correto; skip gracioso quando não há pools na data; output em `gold/sql_pool_allocation_share`; databases sem tag `FINOPS-CLIENTE` alocados como `COMPARTILHADO` (entram no rateio proporcional); gera `databases_sem_tag_{date}.csv` para auditoria
+- [x] `finops/steps/s03b_aks.py` — AKS via OpenCost; namespaces `DEFAULT` e `COMPARTILHADO` redistribuídos proporcionalmente (não entram como cliente); gera `namespaces_sem_alias_{date}.csv` para auditoria
+- [x] `finops/steps/s03c_sql_pool.py` — SQL Elastic Pools: ARM API + Monitor CPU; databases COMPARTILHADO redistribuídos proporcionalmente aos databases tagueados do mesmo pool (share calculado sobre `total_tagged_weighted`); gera `databases_sem_tag_{date}.csv` para auditoria
 - [x] `finops/steps/s04_client_weights.py` — peso por custo dedicado, fallback igualitário
-- [x] `finops/steps/s05_consolidate.py` — consolida s03a+s03b+s03c, distribui restante por client_weights
-- [x] `finops/steps/s06_fact_allocated_cost.py` — AllocatedCost = Cost × Share, 5 outputs por data
+- [x] `finops/steps/s05_consolidate.py` — consolida s03a+s03b+s03c, distribui restante por client_weights; `_read_csv_partition` filtra CSVs por `include_prefix`/`exclude_patterns` para evitar leitura de arquivos de auditoria/detalhe que não têm `AllocationMethod`
+- [x] `finops/steps/s06_fact_allocated_cost.py` — AllocatedCost = Cost × Share, 5 outputs por data; guard defensivo descarta e loga linhas residuais com `AllocationMethod=NaN`
 - [x] `finops/steps/s07_consolidate_pbi.py` — append diário idempotente + manifest.csv; TotalCost lido da reconciliation (não do campo Cost inflado); validação (linhas + TotalAllocated diff < 1.0); manifest ERROR em falha
 - [x] `jobs/run_aks.py`
 - [x] `jobs/run_sync_rg_tags.py`
@@ -370,7 +370,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `config/reference/clientes_alias.csv`
 
 ### Infraestrutura provisionada
-- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (cq10, 2026-05-25; inclui s01 EffectiveCost + s03c COMPARTILHADO + s06 threshold 0.05 + s02 rule4_wins fix + retro_fix batch consolidation)
+- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (cq11, 2026-05-26; inclui s03b DEFAULT fix + s03c COMPARTILHADO redistribuição + s05 CSV filter + s06 NaN guard)
 - [x] Container `finops-v2` criado em `stpslkmmfinopseusprd`
 
 ### Clusters AKS — todos os 5 com OpenCost operacionais ✅
@@ -386,6 +386,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - `finops-pipeline` CronJob — 06:00 UTC ✅
 - Retrocarga original: 2026-05-01 a 2026-05-15 (15/15 OK, 100% alocado)
 - Retrocarga corretiva: 2026-05-15 a 2026-05-20 (6/6 OK) — reprocessado com FOCUS atualizado (2026-05-21)
+- Retrocarga pós-bugfix (2026-05-26): 24/24 OK — bugs SQLPOOL duplicatas + DEFAULT + COMPARTILHADO corrigidos
 
 #### aks-prd-br-newkmm (2026-05-04)
 - Identity: `id-mg-kmm-finops-aks-prd-br-newkmm-eus-prd` (CLIENT_ID: `e67c4ddc-1e3f-451b-a9bd-b41296bf2834`)
@@ -403,7 +404,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 
 ---
 
-## Validação do pipeline (2026-05-25)
+## Validação do pipeline (2026-05-26)
 
 Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 
@@ -411,12 +412,12 @@ Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 |---|---|
 | Escopo | `52d4423b` (KMM PRD) + `3f6d197f` (KMM DEV-TEST) |
 | TotalAllocated | **100,0%** (todas as 24 datas) |
-| Custo médio diário | ~R$ 13.400–15.200/dia (dados settlados, varia por dia) |
+| Custo médio diário | ~R$ 13.100–15.200/dia (dados settlados, varia por dia) |
 | Total maio (24 datas, 01–24) | **R$ 336.659** | média diária: **~R$ 14.027** |
 | Projeção maio completo | ~R$ 434k (alinhado ao esperado ~R$ 430k) |
 | Método predominante | WEIGHT_PROPORTIONAL + DEDICATED_TAG + AKS_OPENCOST |
-| AKS_OPENCOST | Ativo — R$ ~1.500/dia via consumo real de namespace (fix 2026-05-25: `rule4_wins` corrigido em s02) |
-| SQLPOOL | Ativo — 7 pools processados; databases taggeados (tagging concluído 2026-05-24) |
+| AKS_OPENCOST | Ativo — R$ ~1.500/dia via consumo real de namespace |
+| SQLPOOL | Ativo — 7 pools; custo de DBs COMPARTILHADO redistribuído aos DBs tagueados do mesmo pool |
 | EffectiveCost | Usado em vez de BilledCost — RI amortizada embutida nas linhas Usage; Purchase (EffectiveCost=0) filtrado |
 
 5 outputs do s06 por data em `gold/fact_allocated_cost/dt=<data>/`:
@@ -426,13 +427,13 @@ Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 - `reconciliation_<data>.csv`
 - `unallocated_cost_<data>.csv`
 
-Consolidado Power BI — atualizado em 2026-05-25 (retrocarga completa pós-fix AKS_OPENCOST):
-- `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet`: **1.621.537 linhas**, 24 datas (2026-05-01 a 2026-05-24), Status=OK
-- Retrocarga 2026-05-01 a 2026-05-24: **24/24 ✅** — AKS_OPENCOST ativo + databases SQL taggeados
+Consolidado Power BI — atualizado em 2026-05-26 (retrocarga completa pós-bugfix):
+- `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet`: **1.601.714 linhas**, 24 datas (2026-05-01 a 2026-05-24), Status=OK
+- Redução de ~19.823 linhas vs build anterior (1.621.537) — remoção das duplicatas SQLPOOL
+- Retrocarga 2026-05-01 a 2026-05-24: **24/24 ✅** — sem COMPARTILHADO, sem DEFAULT, sem NaN AllocationMethod
 - `TotalCost` no manifest lido de `reconciliation_<data>.csv` (sem duplicação do fan-out)
 - Total maio (24 datas): **R$ 336.659** | média diária: **R$ 14.027**
 - Consolidação feita em lote único (`_rebuild_consolidated_batch`) — 1 download + 1 upload do consolidado
-- 2026-05-24 mostrou +174,5% vs antes: estava com D+1 parcial no FOCUS anterior (normal — será reprocessado pelo CronJob retro-fix semanal)
 
 ### FOCUS_LAG_DAYS = 3 — estratégia D-3 + retro semanal
 
@@ -485,16 +486,30 @@ Nota: `Rule` no r2s ainda mostra `TAG_RG_SHARED` (np.select não foi alterado), 
 - WEIGHT_PROPORTIONAL: R$ 1.986 (reduziu conforme esperado)
 - TotalAllocated: 100% mantido
 
-**Imagem publicada:** `registrykmm.azurecr.io/finops-pipeline:latest` (build cq10, 2026-05-25)
-**Retrocarga 2026-05-01 a 2026-05-24 concluída (24/24 ✅, 2026-05-25)** — consolidado atualizado com AKS_OPENCOST ativo.
+**Imagem publicada:** `registrykmm.azurecr.io/finops-pipeline:latest` (build cq11, 2026-05-26)
+**Retrocarga 2026-05-01 a 2026-05-24 concluída (24/24 ✅, 2026-05-26)** — consolidado atualizado pós-bugfix.
+
+### ~~3 bugs de alocação~~ — RESOLVIDOS (2026-05-26) ✅
+
+**BUG 1 — SQLPOOL: 19.058 linhas duplicadas com `AllocationMethod=NaN`** (R$64k / 19% do total)
+- **Causa raiz:** `s05._read_csv_partition` lia TODOS os CSVs do prefix sql_pool e aks, incluindo arquivos de auditoria/detalhe que não têm coluna `AllocationMethod`. O pd.concat injetava NaN nessa coluna no `allocation_share_final`.
+- **Fix:** `_read_csv_partition` aceita `include_prefix` e `exclude_patterns`; SQL filtrado para `sqlpool_allocation_share_all_*`, AKS exclui `namespaces_sem_alias_*`. Guard em s06 descarta residuais com log `⚠ Removendo N linhas sem AllocationMethod`.
+
+**BUG 2 — AKS: Cliente `DEFAULT` (R$4.824 / 1,4%)**
+- **Causa raiz:** namespaces resolvidos via `clientes_alias.csv` como `DEFAULT` passavam o filtro `!= "COMPARTILHADO"` e entravam em `client_costs` como cliente real.
+- **Fix:** s03b adiciona `"DEFAULT"` à lista de exclusão; esses namespaces vão para `unmapped_cost` (redistribuição proporcional). Gera `namespaces_sem_alias_{date}.csv` para auditoria.
+
+**BUG 3 — SQL: Cliente `COMPARTILHADO` residual (R$673 / 0,2%)**
+- **Causa raiz:** s03c adicionava databases sem tag como `Cliente=COMPARTILHADO` em `all_share`, produzindo linha de custo real no output.
+- **Fix:** s03c separa `tagged_rows` de `compartilhado_rows`; shares calculados sobre `total_tagged_weighted` (denominador exclui COMPARTILHADO, absorvendo proporcional). COMPARTILHADO vai apenas para `sqlpool_detail_all_` com `Share=0`.
 
 ### Qualidade de dados (melhorias incrementais)
-- [x] ~~Taguear databases SQL Elastic Pool com `FINOPS-CLIENTE`~~ — concluído (2026-05-24); s03c mapeia database → cliente pela tag; `databases_sem_tag_{date}.csv` deve estar vazio ou com resíduos mínimos
+- [x] ~~Taguear databases SQL Elastic Pool com `FINOPS-CLIENTE`~~ — concluído (2026-05-24); s03c redistribui custo de databases COMPARTILHADO proporcionalmente; `databases_sem_tag_{date}.csv` gerado para auditoria
 - [x] ~~Reserved Instances de VMs AKS~~ — resolvido via `EffectiveCost` no s01 (2026-05-24). EffectiveCost distribui o custo de RI de volta para os recursos com RG correto (incluindo MC_* dos clusters AKS). Purchase lines (EffectiveCost=0) removidas pelo filtro `EffectiveCost>0`. Arquivo `ri_cluster_map.csv` não necessário.
-- [x] ~~Tags numéricas~~ — investigado em 2026-05-25; zero ocorrências no consolidado de maio (1.621.537 linhas). Não confirmado nos dados reais — item encerrado.
+- [x] ~~Tags numéricas~~ — investigado em 2026-05-25; zero ocorrências no consolidado de maio. Não confirmado nos dados reais — item encerrado.
 
 ### Relatórios / Power BI
-- [x] Criar arquivo consolidado `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet` — **1.621.537 linhas**, 24 datas (2026-05-01 a 2026-05-24) ✅
+- [x] Criar arquivo consolidado `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet` — **1.601.714 linhas**, 24 datas (2026-05-01 a 2026-05-24) ✅
 - [x] manifest.csv com status por data — TotalCost corrigido (sem inflação do fan-out) ✅
 - [ ] Power BI — conectar direto no Blob Storage (`finops-v2`) via Azure Storage connector e apontar para o consolidado
 - [x] **Pipeline processa D-3** — `FOCUS_LAG_DAYS=3` em `finops/utils/dates.py`; log: `📅 Pipeline date: YYYY-MM-DD (D-3, FOCUS lag=3 dias)` ✅
@@ -508,8 +523,8 @@ Nota: `Rule` no r2s ainda mostra `TAG_RG_SHARED` (np.select não foi alterado), 
 2. Para cada pool → `GET .../elasticPools/{pool}/databases` (ARM API)
 3. Para cada database → CPU média via Azure Monitor (`cpu_percent`, agregação diária)
 4. Mapeia database → cliente via tag `FINOPS-CLIENTE` no database
-5. Databases sem tag → redistribuídos proporcionalmente aos clientes mapeados
-6. `Share = cpu_cliente / cpu_total_pool`
+5. Databases com tag COMPARTILHADO (ou sem tag) → WeightedUsage redistribuído proporcionalmente aos clientes tagueados do mesmo pool; não geram linha em `allocation_share_final`
+6. `Share = WeightedUsage_cliente / total_tagged_weighted_pool`
 7. Fallback: CPU = 0 recebe peso mínimo `0.01` para não ser descartado silenciosamente
 
 **Permissões necessárias:** `Reader` nas subscriptions (já atribuído) — suficiente para ARM list e Monitor metrics.
