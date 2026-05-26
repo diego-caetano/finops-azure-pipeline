@@ -32,10 +32,23 @@ _SHARE_TOLERANCE = 0.001
 _OUTPUT_COLUMNS = ["Date", "ServiceKey", "Cliente", "Share", "DriverType", "AllocationMethod"]
 
 
-def _read_csv_partition(store, prefix: str, date_str: str) -> pd.DataFrame:
-    """Read and concat all CSVs under prefix/dt=date_str/."""
+def _read_csv_partition(
+    store,
+    prefix: str,
+    date_str: str,
+    include_prefix: str = "",
+    exclude_patterns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Read and concat CSVs under prefix/dt=date_str/, with optional filename filters."""
     blobs = store.list_blobs(f"{prefix}/{to_partition(date_str)}/")
     csv_blobs = [b for b in blobs if b.endswith(".csv")]
+    if include_prefix:
+        csv_blobs = [b for b in csv_blobs if include_prefix in b.split("/")[-1]]
+    if exclude_patterns:
+        csv_blobs = [
+            b for b in csv_blobs
+            if not any(pat in b.split("/")[-1] for pat in exclude_patterns)
+        ]
     if not csv_blobs:
         return pd.DataFrame(columns=_OUTPUT_COLUMNS)
     frames = [store.read_csv(b) for b in csv_blobs]
@@ -67,9 +80,16 @@ def run(pipeline_date: Optional[str] = None) -> None:
     logger.info("📊 %d ServiceKeys únicos em r2s", len(all_keys_df))
 
     # Load pre-computed shares from s03a, s03b, s03c
+    # Note: each prefix may contain audit/detail CSVs — filter to allocation share files only
     df_dedicated = _read_csv_partition(store, _DEDICATED_OUT_PREFIX, date_str)
-    df_aks = _read_csv_partition(store, _AKS_OUT_PREFIX, date_str)
-    df_sql = _read_csv_partition(store, _SQL_POOL_OUT_PREFIX, date_str)
+    df_aks = _read_csv_partition(
+        store, _AKS_OUT_PREFIX, date_str,
+        exclude_patterns=["namespaces_sem_alias_"],
+    )
+    df_sql = _read_csv_partition(
+        store, _SQL_POOL_OUT_PREFIX, date_str,
+        include_prefix="sqlpool_allocation_share_all_",
+    )
 
     pre_frames = [df for df in (df_dedicated, df_aks, df_sql) if not df.empty]
     pre_computed = pd.concat(pre_frames, ignore_index=True) if pre_frames else pd.DataFrame(columns=_OUTPUT_COLUMNS)

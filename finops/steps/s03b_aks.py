@@ -136,17 +136,25 @@ def run(pipeline_date: Optional[str] = None) -> None:
         logger.warning("⚠ Custo de negócio = 0 para %s — abortando", cluster_name)
         return
 
-    # Map namespace → client; redistribute unmapped to system bucket
+    # Map namespace → client; redistribute unmapped (incl. DEFAULT) to system bucket
     client_costs: dict[str, float] = {}
     unmapped_cost = 0.0
+    unmapped_ns: list[dict] = []
 
     for ns, cost in business.items():
         cliente = _resolve_client(ns, alias_df)
-        if cliente and cliente.upper() != "COMPARTILHADO":
+        if cliente and cliente.upper() not in ("COMPARTILHADO", "DEFAULT"):
             client_costs[cliente] = client_costs.get(cliente, 0.0) + cost
         else:
             logger.debug("Namespace sem mapeamento: %s (custo=%.6f) → sistema", ns, cost)
             unmapped_cost += cost
+            unmapped_ns.append({
+                "Cluster": cluster_name,
+                "Namespace": ns,
+                "UnmappedCost": round(cost, 6),
+                "AliasResolvido": cliente or "",
+                "RedistribuidoPara": "system_bucket",
+            })
 
     # Accumulate all system cost (infra + unmapped)
     total_system = system_cost + unmapped_cost
@@ -183,3 +191,9 @@ def run(pipeline_date: Optional[str] = None) -> None:
     blob_name = f"{_AKS_OUT_PREFIX}/{to_partition(date_str)}/{cluster_name}.csv"
     store.write_csv(blob_name, df_out)
     logger.info("⬆️  Gravado: %s", blob_name)
+
+    if unmapped_ns:
+        df_unmapped = pd.DataFrame(unmapped_ns)
+        blob_unmapped = f"{_AKS_OUT_PREFIX}/{to_partition(date_str)}/namespaces_sem_alias_{date_str}.csv"
+        store.write_csv(blob_unmapped, df_unmapped)
+        logger.info("📋 Namespaces sem alias: %d → %s", len(df_unmapped), blob_unmapped)

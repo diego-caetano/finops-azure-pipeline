@@ -49,6 +49,8 @@ OUT_PREFIX                   = os.environ.get("SQL_POOL_OUT_PREFIX", "gold/sql_p
 CPU_WEIGHT  = float(os.environ.get("SQL_CPU_WEIGHT",  "0.97"))
 DISK_WEIGHT = float(os.environ.get("SQL_DISK_WEIGHT", "0.03"))
 
+_COMPARTILHADO = "COMPARTILHADO"
+
 TARGET_SUBSCRIPTIONS = [
     s.strip()
     for s in os.environ.get(
@@ -301,6 +303,7 @@ def run(pipeline_date: str | None = None) -> None:
     all_detail: list[dict]   = []
     all_share:  list[dict]   = []
     all_diag:   list[dict]   = []
+    sem_tag_rows: list[dict] = []
 
     for pool in pools:
         sub   = pool["SubscriptionId"]
@@ -355,9 +358,9 @@ def run(pipeline_date: str | None = None) -> None:
 
             # 1ª opção: tag FINOPS-CLIENTE lida do ARM (case-insensitive, já normalizada)
             # 2ª opção: fallback via resource_to_service (databases raramente aparecem no FOCUS)
-            cliente = "DEFINIR"
+            cliente = _COMPARTILHADO
             finops_tag = db_info.get("finops_cliente")
-            if finops_tag and finops_tag not in ("COMPARTILHADO", "SEM TAG", ""):
+            if finops_tag and finops_tag not in (_COMPARTILHADO, "SEM TAG", ""):
                 cliente = finops_tag
             elif cliente_col:
                 match = df_rts[
@@ -366,7 +369,7 @@ def run(pipeline_date: str | None = None) -> None:
                 ]
                 if not match.empty:
                     val = str(match.iloc[0].get(cliente_col, "") or "").strip().upper()
-                    if val and val not in ("COMPARTILHADO", "SEM TAG", ""):
+                    if val and val not in (_COMPARTILHADO, "SEM TAG", ""):
                         cliente = val
 
             cpu_avg    = _get_metric_avg(metrics_client, db_rid, "cpu_percent",     start_dt, end_dt, 4)
@@ -378,6 +381,18 @@ def run(pipeline_date: str | None = None) -> None:
                 "  DB=%s | Cliente=%s | CPU=%.4f | DiskPct=%.4f | DiskGB=%.4f",
                 db, cliente, cpu_avg, disk_pct, disk_gb,
             )
+
+            if cliente == _COMPARTILHADO:
+                logger.warning(
+                    "⚠ Database sem tag FINOPS-CLIENTE — alocado como COMPARTILHADO: "
+                    "Pool: %s | Database: %s | CPU: %.2f%%",
+                    pool_name, db, cpu_avg,
+                )
+                sem_tag_rows.append({
+                    "Date": usage_date, "Pool": pool_name, "Database": db,
+                    "ResourceGroup": rg, "CPU_Percent": cpu_avg,
+                    "AllocatedAs": _COMPARTILHADO, "Motivo": "Tag FINOPS-CLIENTE ausente",
+                })
 
             detail_rows.append({
                 "UsageDate": usage_date, "ServiceKey": sk,
@@ -409,56 +424,50 @@ def run(pipeline_date: str | None = None) -> None:
             r["ContribDiskPct"] = round(contrib_disk, 4)
             r["WeightedUsage"]  = round(weighted, 6)
 
-        # Separa DBs de infra (sem tag FINOPS-CLIENTE) dos DBs de clientes tagueados.
-        # O custo dos DBs de infra é redistribuído proporcionalmente ao uso dos clientes
-        # tagueados no mesmo pool — quem usa mais absorve mais do custo compartilhado.
-        infra_rows    = [r for r in detail_rows if r["Cliente"] == "DEFINIR"]
-        billable_rows = [r for r in detail_rows if r["Cliente"] != "DEFINIR"]
+        total_weighted = sum(r["WeightedUsage"] for r in detail_rows)
+        logger.info("TotalWeighted=%.6f", total_weighted)
 
-        if infra_rows:
-            infra_dbs = [r["Database"] for r in infra_rows]
-            logger.info("  ♻ DBs sem tag (infra compartilhada) → redistribuídos: %s", infra_dbs)
+        # Separa tagueados de COMPARTILHADO — redistribui custo de COMPARTILHADO aos tagueados
+        tagged_rows        = [r for r in detail_rows if r["Cliente"] != _COMPARTILHADO]
+        compartilhado_rows = [r for r in detail_rows if r["Cliente"] == _COMPARTILHADO]
 
-        # Denominador: apenas os billable (redistribui infra proporcionalmente).
-        # Se não há billable (pool 100% infra), usa todos os DBs como fallback.
-        rows_for_share = billable_rows if billable_rows else detail_rows
-        total_weighted = sum(r["WeightedUsage"] for r in rows_for_share)
-        logger.info(
-            "TotalWeighted(todos)=%.6f | TotalWeighted(billable)=%.6f",
-            sum(r["WeightedUsage"] for r in detail_rows), total_weighted,
-        )
+        if not tagged_rows:
+            # Todos sem tag — fallback: distribui igualmente entre todos
+            logger.warning("⚠ Todos os databases sem tag em %s — fallback igual por %d DBs", sk, len(detail_rows))
+            tagged_rows = detail_rows
+            compartilhado_rows = []
 
-        # Share — com fallback igual por DB se weighted = 0
+        if compartilhado_rows:
+            comp_weight = sum(r["WeightedUsage"] for r in compartilhado_rows)
+            logger.info(
+                "  Redistribuindo %d DB(s) COMPARTILHADO (WeightedUsage=%.6f) para %d cliente(s) tagueado(s)",
+                len(compartilhado_rows), comp_weight, len(tagged_rows),
+            )
+
+        total_tagged_weighted = sum(r["WeightedUsage"] for r in tagged_rows)
+
+        # Share — fallback igual por DB se weighted = 0; COMPARTILHADO absorvido pelos tagueados
         fallback = False
-        if total_weighted <= 0:
-            logger.warning(f"⚠ TotalWeighted=0 → fallback igual por {len(rows_for_share)} DBs")
+        if total_tagged_weighted <= 0:
+            logger.warning("⚠ TotalTaggedWeighted=0 → fallback igual por %d DBs", len(tagged_rows))
             fallback = True
-            equal_share = 1.0 / len(rows_for_share)
+            equal_share = 1.0 / len(tagged_rows)
 
-        for r in detail_rows:
-            if r["Cliente"] == "DEFINIR":
-                # Infra: registra no detail para auditoria, não gera linha de alocação
-                r["Share"]         = 0.0
-                r["AllocatedCost"] = 0.0
-                r["PoolDailyCost"] = pool_daily_cost
-                r["DriverFallback"] = "REDISTRIBUTED_TO_CLIENTS"
-                all_detail.append(r)
-                continue
-
+        for r in tagged_rows:
             if fallback:
                 share = equal_share
                 driver = "SQLPOOL_DB_COUNT_FALLBACK"
                 allocation_method = "SQLPOOL_DB_COUNT"
             else:
-                share = r["WeightedUsage"] / total_weighted
+                share = r["WeightedUsage"] / total_tagged_weighted
                 driver = "SQLPOOL_DB_METRICS"
                 allocation_method = "SQLPOOL_CPU"
 
             alloc_cost = pool_daily_cost * share
 
-            r["Share"]         = round(share, 6)
-            r["AllocatedCost"] = round(alloc_cost, 6)
-            r["PoolDailyCost"] = pool_daily_cost
+            r["Share"]          = round(share, 6)
+            r["AllocatedCost"]  = round(alloc_cost, 6)
+            r["PoolDailyCost"]  = pool_daily_cost
             r["DriverFallback"] = "DB_COUNT_EQUAL_SPLIT" if fallback else ""
 
             all_detail.append(r)
@@ -471,6 +480,14 @@ def run(pipeline_date: str | None = None) -> None:
                 "AllocationMethod": allocation_method,
             })
 
+        # COMPARTILHADO vai apenas para auditoria (share=0, custo redistribuído para tagueados)
+        for r in compartilhado_rows:
+            r["Share"]          = 0.0
+            r["AllocatedCost"]  = 0.0
+            r["PoolDailyCost"]  = pool_daily_cost
+            r["DriverFallback"] = "REDISTRIBUTED_TO_TAGGED_CLIENTS"
+            all_detail.append(r)
+
         status = "PROCESSED_FALLBACK_DB_COUNT" if fallback else "PROCESSED_METRICS"
         all_diag.append({
             "ServiceKey": sk, "Status": status,
@@ -480,7 +497,10 @@ def run(pipeline_date: str | None = None) -> None:
             "TotalDiskPct": total_disk,
             "TotalWeighted": total_weighted,
         })
-        logger.info(f"✅ {sk} — {len(detail_rows)} DBs processados")
+        logger.info(
+            "✅ %s — %d DB(s) tagueado(s) + %d COMPARTILHADO redistribuído(s)",
+            sk, len(tagged_rows), len(compartilhado_rows),
+        )
 
     if not all_detail:
         logger.warning("⚠ Nenhum pool SQL processado com sucesso — pools encontrados mas sem DBs acessíveis")
@@ -525,6 +545,18 @@ def run(pipeline_date: str | None = None) -> None:
         PIPELINE_STORAGE_ACCOUNT, PIPELINE_CONTAINER,
         f"{base}/sqlpool_allocation_share_all_{usage_date}.csv",
     )
+
+    if sem_tag_rows:
+        df_sem_tag = pd.DataFrame(sem_tag_rows)
+        upload_csv(
+            df_sem_tag,
+            PIPELINE_STORAGE_ACCOUNT, PIPELINE_CONTAINER,
+            f"{base}/databases_sem_tag_{usage_date}.csv",
+        )
+        logger.info(
+            "📋 Databases sem tag: %d em %d pools",
+            len(sem_tag_rows), df_sem_tag["Pool"].nunique(),
+        )
 
     # ── Resumo ─────────────────────────────────────────────────────────────
     logger.info("\n== RESUMO ==")

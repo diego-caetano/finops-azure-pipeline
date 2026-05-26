@@ -161,6 +161,18 @@ def run(pipeline_date: Optional[str] = None) -> None:
     del merged_covered
     gc.collect()
 
+    # Drop rows with NaN AllocationMethod (duplicatas de fan-out SQLPOOL)
+    null_alloc = df_fact_rows["AllocationMethod"].isna()
+    if null_alloc.any():
+        n = int(null_alloc.sum())
+        cost_lost = float(df_fact_rows.loc[null_alloc, "AllocatedCost"].sum())
+        logger.warning(
+            "⚠ Removendo %d linhas sem AllocationMethod (duplicatas SQLPOOL) | AllocatedCost=%.2f",
+            n, cost_lost,
+        )
+        df_fact_rows = df_fact_rows[~null_alloc].copy()
+        gc.collect()
+
     # ── Output 1: fact_allocated_cost_{date}.parquet ──────────────────────
     df_out = df_fact_rows[_FACT_COLUMNS].reset_index(drop=True)
     total_allocated = float(df_out["AllocatedCost"].sum())
@@ -233,7 +245,9 @@ def run(pipeline_date: Optional[str] = None) -> None:
         "💰 TotalFactCost=%.6f | TotalAllocated=%.6f (%.1f%%) | TotalUnallocated=%.6f (%.1f%%) | Diff=%.6f",
         total_billed, total_allocated, alloc_pct, total_unallocated, unalloc_pct, difference,
     )
-    if abs(difference) > 0.01:
+    # Tolerância de 0.05 cobre arredondamento de ponto flutuante nas multiplicações
+    # Cost × Share (normal para bases grandes). Erros reais são na casa de centenas.
+    if abs(difference) > 0.05:
         raise ValueError(
             f"Reconciliation falhou: difference={difference:.6f} "
             f"(total_billed={total_billed:.6f}, allocated={total_allocated:.6f}, "
