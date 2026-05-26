@@ -86,6 +86,24 @@ def run(pipeline_date: Optional[str] = None) -> None:
         store, _AKS_OUT_PREFIX, date_str,
         exclude_patterns=["namespaces_sem_alias_"],
     )
+    # Colapsa por (ServiceKey, Cliente) — CSVs legados podem ter 1 linha por namespace
+    # em vez de 1 linha por cliente, o que causaria fan-out inflado em s06
+    if not df_aks.empty:
+        n_before = len(df_aks)
+        df_aks = (
+            df_aks.groupby(["Date", "ServiceKey", "Cliente"], as_index=False)
+            .agg(
+                Share=("Share", "sum"),
+                DriverType=("DriverType", "first"),
+                AllocationMethod=("AllocationMethod", "first"),
+            )
+        )
+        if len(df_aks) < n_before:
+            logger.info(
+                "📊 df_aks dedup: %d → %d linhas (CSVs legados por namespace colapsados)",
+                n_before, len(df_aks),
+            )
+
     df_sql = _read_csv_partition(
         store, _SQL_POOL_OUT_PREFIX, date_str,
         include_prefix="sqlpool_allocation_share_all_",

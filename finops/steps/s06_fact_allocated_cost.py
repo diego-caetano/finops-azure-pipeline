@@ -82,6 +82,23 @@ def run(pipeline_date: Optional[str] = None) -> None:
     df_shares = store.read_parquet(f"{_FINAL_PREFIX}/{partition}/allocation_share_final.parquet")
     logger.info("📊 df_shares: %d linhas, RSS=%.0fMB", len(df_shares), _rss_mb())
 
+    # Guard: garante 1 linha por (ServiceKey, Cliente) antes do fan-out join.
+    # CSVs legados de s03b podiam ter 1 linha por namespace → fan-out inflado.
+    dup_mask = df_shares.duplicated(subset=["ServiceKey", "Cliente"])
+    if dup_mask.any():
+        n_dup = int(dup_mask.sum())
+        logger.warning(
+            "⚠ allocation_share_final: %d pares (ServiceKey, Cliente) duplicados — "
+            "colapsando antes do join para evitar fan-out inflado",
+            n_dup,
+        )
+        agg: dict = {"Share": "sum"}
+        for col in ["AllocationMethod", "DriverType"]:
+            if col in df_shares.columns:
+                agg[col] = "first"
+        df_shares = df_shares.groupby(["ServiceKey", "Cliente"], as_index=False).agg(agg)
+        logger.info("📊 df_shares após dedup: %d linhas", len(df_shares))
+
     total_billed = float(df_fc["Cost"].sum())
     logger.info("💰 TotalFactCost=%.6f", total_billed)
 
