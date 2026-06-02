@@ -16,16 +16,4 @@ Pipeline de alocação de custos Azure que transforma o FOCUS Report em custos d
 
 ---
 
-## Estado atual (maio/2026 — cq18)
 
-| Métrica | Valor |
-|---|---|
-| Pipeline | ✅ operacional (cq18, 2026-05-28) |
-| Custo médio diário | ~R$ 14.062 |
-| Total maio (25 dias) | R$ 351.552,92 |
-| Clientes ativos | 91 |
-| Linhas no consolidado maio | 707.805 |
-| D-3 lag | ✅ configurado (`FOCUS_LAG_DAYS=3`) |
-| Retrocarga semanal | ✅ toda segunda 07:00 UTC |
-| s03d Backup | ✅ operacional — 2 vaults, BACKUP_VAULT_ITEMS ativo |
-| s08 Quality Check | ✅ alertas diários em `gold/quality_alerts/` |
