@@ -259,7 +259,11 @@ def _rebuild_consolidated_batch(pass_dates: list[str]) -> None:
 def run_date(date_str: str) -> None:
     for name, step_fn in _STEPS:
         logger.info("▶️  %s", name)
-        step_fn(date_str)
+        try:
+            step_fn(date_str)
+        except Exception:
+            logger.exception("❌ %s falhou  date=%s", name, date_str)
+            raise
         _release_memory()
         logger.info("✅ %s concluído", name)
 

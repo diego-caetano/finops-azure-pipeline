@@ -122,8 +122,8 @@ def run(pipeline_date: Optional[str] = None) -> None:
             for _, row in ov_df.iterrows():
                 if pd.notna(row.get("ClusterName")):
                     overrides_map[str(row["ResourceGroupName"]).strip().upper()] = str(row["ClusterName"])
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("⚠ overrides_rg_auto.csv indisponível: %s", exc)
 
     # ── Vetores base ───────────────────────────────────────────────────────
     rg_upper = df["ResourceGroupName"].fillna("").str.strip().str.upper()

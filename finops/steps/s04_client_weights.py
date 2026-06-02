@@ -37,16 +37,16 @@ def _known_clients(store) -> list[str]:
             v = str(val).strip().upper()
             if v and v != "COMPARTILHADO":
                 clients.add(v)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("⚠ rg_tags.csv indisponível para fallback igualitário: %s", exc)
     try:
         alias_df = store.read_csv(f"{_REFERENCE_PREFIX}/clientes_alias.csv")
         for val in alias_df["Cliente"].dropna().unique():
             v = str(val).strip().upper()
             if v and v != "COMPARTILHADO":
                 clients.add(v)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("⚠ clientes_alias.csv indisponível para fallback igualitário: %s", exc)
     return sorted(clients)
 
 

@@ -74,7 +74,11 @@ def main() -> None:
 
     for name, step_fn in _STEPS:
         logger.info("▶️  %s  [RSS=%.0fMB]", name, _rss_mb())
-        step_fn(pipeline_date)
+        try:
+            step_fn(pipeline_date)
+        except Exception:
+            logger.exception("❌ %s falhou  date=%s", name, pipeline_date or "auto")
+            raise
         _release_memory()
         logger.info("✅ %s concluído  [RSS=%.0fMB]", name, _rss_mb())
 
