@@ -1,12 +1,13 @@
 """
-s07_consolidate_pbi.py — Consolida fact_allocated_cost diário no parquet Power BI.
+s07_consolidate_pbi.py — Consolida fact_allocated_cost diário no parquet mensal para BI.
 
-Appenda o parquet do dia ao consolidado histórico e atualiza manifest.csv.
+Appenda o parquet do dia ao consolidado do mês correspondente e atualiza manifest.csv.
 Idempotente: remove e reinsere a data a cada execução.
+Ao virar o mês o arquivo anterior fica selado — s07 cria um novo arquivo mensal.
 
 Saídas (gold/fact_allocated_cost_consolidated/):
-  fact_allocated_cost_all.parquet   — histórico completo para Power BI
-  manifest.csv                      — uma linha por data (Date desc)
+  fact_allocated_cost_YYYY-MM.parquet  — um arquivo por mês (selado ao virar o mês)
+  manifest.csv                          — uma linha por data (Date desc, todos os meses)
 """
 
 import gc
@@ -23,14 +24,19 @@ from finops.utils.dates import resolve_pipeline_date, to_partition
 logger = logging.getLogger(__name__)
 
 _FACT_PREFIX = os.getenv("FACT_ALLOCATED_COST_PREFIX", "gold/fact_allocated_cost")
-_PBI_BLOB = os.getenv(
-    "PBI_CONSOLIDATED_BLOB",
-    "gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet",
+_PBI_CONSOLIDATED_PREFIX = os.getenv(
+    "PBI_CONSOLIDATED_PREFIX",
+    "gold/fact_allocated_cost_consolidated",
 )
 _PBI_MANIFEST = os.getenv(
     "PBI_MANIFEST_BLOB",
     "gold/fact_allocated_cost_consolidated/manifest.csv",
 )
+
+
+def _monthly_blob(date_str: str) -> str:
+    """Retorna o path do parquet mensal para a data fornecida."""
+    return f"{_PBI_CONSOLIDATED_PREFIX}/fact_allocated_cost_{date_str[:7]}.parquet"
 
 _MANIFEST_COLUMNS = [
     "Date", "Status", "Rows", "TotalAllocated", "TotalCost", "ProcessedAt", "PipelineRun",
@@ -39,7 +45,8 @@ _MANIFEST_COLUMNS = [
 
 def run(pipeline_date: Optional[str] = None) -> None:
     date_str = resolve_pipeline_date(pipeline_date)
-    logger.info("📅 s07_consolidate_pbi  date=%s", date_str)
+    monthly_blob = _monthly_blob(date_str)
+    logger.info("📅 s07_consolidate_pbi  date=%s  blob=%s", date_str, monthly_blob)
 
     store = pipeline_client()
     storage_account = os.environ["PIPELINE_STORAGE_ACCOUNT"]
@@ -80,12 +87,12 @@ def run(pipeline_date: Optional[str] = None) -> None:
             logger.warning("⚠ reconciliation não encontrada — TotalCost será 0")
             total_cost_day = 0.0
 
-        # ── Step 2: Carrega consolidado existente ─────────────────────────
+        # ── Step 2: Carrega consolidado mensal existente ──────────────────
         try:
-            df_all = store.read_parquet(_PBI_BLOB)
-            logger.info("📊 consolidado existente: %d linhas", len(df_all))
+            df_all = store.read_parquet(monthly_blob)
+            logger.info("📊 consolidado mensal existente: %d linhas", len(df_all))
         except Exception:
-            logger.info("📊 consolidado não encontrado — iniciando vazio")
+            logger.info("📊 consolidado mensal não encontrado — iniciando vazio")
             df_all = pd.DataFrame(columns=df_day.columns)
 
         # ── Step 3: Remove linhas do dia (idempotência) ───────────────────
@@ -96,12 +103,23 @@ def run(pipeline_date: Optional[str] = None) -> None:
             logger.info("🗑  Removidas %d linhas antigas do dia %s", removed, date_str)
 
         # ── Step 4: Concat e grava ────────────────────────────────────────
+        # df_day (_FACT_COLUMNS) é o source-of-truth de schema.
+        # Se _FACT_COLUMNS ganhou uma nova coluna desde o último run, o consolidado
+        # antigo não a tem — pd.concat produziria NaN silencioso em datas antigas.
+        for col in df_day.columns:
+            if col not in df_all.columns:
+                df_all[col] = None
+                logger.warning(
+                    "⚠ Schema drift: coluna '%s' ausente no consolidado — retropreenchendo com None",
+                    col,
+                )
+        df_all = df_all[df_day.columns]
         df_combined = pd.concat([df_all, df_day], ignore_index=True)
         del df_all
         gc.collect()
 
-        upload_parquet(df_combined, storage_account, container, _PBI_BLOB)
-        logger.info("⬆️  consolidado: %d linhas → %s", len(df_combined), _PBI_BLOB)
+        upload_parquet(df_combined, storage_account, container, monthly_blob)
+        logger.info("⬆️  consolidado mensal: %d linhas → %s", len(df_combined), monthly_blob)
 
         # ── Step 5: Validações ────────────────────────────────────────────
         df_check = df_combined[df_combined["Date"].astype(str) == date_str]

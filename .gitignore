@@ -32,6 +32,15 @@ logs/
 .env
 .env.local
 
+# Claude Code — memória interna da ferramenta (não é código do projeto)
+.claude/
+
+# Arquivos Power BI — dados de negócio, não é código
+BI/
+
+# Output gerado com dados reais — não é código
+finops-dashboard/output/
+
 # macOS
 .DS_Store
 

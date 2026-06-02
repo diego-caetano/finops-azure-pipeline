@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-build_consolidated.py — Constrói o consolidado Power BI a partir do histórico.
+build_consolidated.py — Constrói os consolidados mensais Power BI a partir do histórico.
 
 Lê todas as partições existentes em gold/fact_allocated_cost/dt=*/
 e chama s07_consolidate_pbi.run() para cada data em ordem crescente.
+Cada mês gera um arquivo fact_allocated_cost_YYYY-MM.parquet separado.
 
 Uso:
     python sh/build_consolidated.py

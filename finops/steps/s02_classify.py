@@ -184,7 +184,9 @@ def run(pipeline_date: Optional[str] = None) -> None:
     )
 
     # ── service_key e notes: apenas Rule 4 altera o padrão (ResourceId) ───
-    rule4_wins = cond4 & ~cond1 & ~cond2 & ~cond3
+    # OVERRIDE_RG_AUTO tem prioridade sobre TAG_RG_SHARED (cond3):
+    # RGs MC_* são node pools AKS — ignorar tag COMPARTILHADO do rg_tags.csv
+    rule4_wins = cond4 & ~cond1 & ~cond2
     service_key = rid.where(~rule4_wins, "AKS:" + aks_cluster.fillna(""))
     notes = pd.Series("", index=df.index, dtype=str).where(
         ~rule4_wins, "cluster=" + aks_cluster.fillna("")
@@ -205,6 +207,30 @@ def run(pipeline_date: Optional[str] = None) -> None:
         )
         service_type_s = pd.Series(service_type, index=df.index)
         service_type_s[valid_pool] = "sql_pool"
+        service_type = service_type_s.values
+
+    # ── Recovery Services Vault override: VAULT:{ResourceName} ───────────
+    # Vault centralizado — ServiceKey por nome permite rateio em s03d por protected items
+    is_vault = df["ResourceType"].str.lower().isin([
+        "microsoft.recoveryservices/vaults",
+        "recovery services vault",
+    ])
+    if is_vault.any():
+        vault_name_col = df["ResourceName"].fillna("")
+        valid_vault = is_vault & (vault_name_col != "")
+        service_key = service_key.where(~valid_vault, "VAULT:" + vault_name_col)
+        service_type_s = pd.Series(service_type, index=df.index)
+        service_type_s[valid_vault] = "backup_vault"
+        service_type = service_type_s.values
+
+    # ── Snapshot service type marker ──────────────────────────────────────
+    is_snapshot = df["ResourceType"].str.lower().isin([
+        "microsoft.compute/snapshots",
+        "snapshot",
+    ])
+    if is_snapshot.any():
+        service_type_s = pd.Series(service_type, index=df.index)
+        service_type_s[is_snapshot] = "snapshot"
         service_type = service_type_s.values
 
     # ── Monta output ───────────────────────────────────────────────────────

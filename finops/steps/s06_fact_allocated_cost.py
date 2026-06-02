@@ -125,6 +125,28 @@ def run(pipeline_date: Optional[str] = None) -> None:
     del merged
     gc.collect()
 
+    # Aggregate meter rows → 1 row per (ResourceId, ServiceKey) before fan-out join.
+    # fact_cost has N billing-meter lines per resource; joining N rows × C clients
+    # inflates the output N-fold without changing AllocatedCost totals.
+    n_meters = len(merged_with_sk)
+    merged_with_sk = (
+        merged_with_sk.groupby(["Date", "ResourceId", "ServiceKey"], as_index=False)
+        .agg(
+            Cost=("Cost", "sum"),
+            ResourceName=("ResourceName", "first"),
+            ResourceGroupName=("ResourceGroupName", "first"),
+            ResourceType=("ResourceType", "first"),
+            SubscriptionId=("SubscriptionId", "first"),
+            ServiceName=("ServiceName", "first"),
+        )
+    )
+    if len(merged_with_sk) < n_meters:
+        logger.info(
+            "📊 meter agg: %d → %d linhas (1 por ResourceId×ServiceKey)",
+            n_meters, len(merged_with_sk),
+        )
+    gc.collect()
+
     # ── Otimização de memória antes do join de fan-out ─────────────────────
     for col in ("ServiceKey", "Cliente", "AllocationMethod"):
         if col in df_shares.columns:

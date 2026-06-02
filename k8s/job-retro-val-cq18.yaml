@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: finops-retro-val-cq18
+  namespace: finops
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        azure.workload.identity/use: "true"
+        app: finops-retro
+    spec:
+      serviceAccountName: finops-workload-identity-sa
+      restartPolicy: Never
+      containers:
+        - name: finops-pipeline
+          image: registrykmm.azurecr.io/finops-pipeline:latest
+          imagePullPolicy: Always
+          command: ["python", "sh/retro_fix.py"]
+          env:
+            - name: RETRO_START
+              value: "2026-05-01"
+            - name: RETRO_END
+              value: "2026-05-03"
+            - name: SKIP_CONSOLIDATED_REBUILD
+              value: "1"
+          envFrom:
+            - configMapRef:
+                name: finops-pipeline-config
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "16Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: ["ALL"]

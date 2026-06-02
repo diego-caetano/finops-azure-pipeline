@@ -182,6 +182,17 @@ def run(pipeline_date: Optional[str] = None) -> None:
     ]
 
     df_out = pd.DataFrame(shares)
+
+    # Defensive: remove DEFAULT rows (should never appear; namespace filter above handles it)
+    default_mask = df_out["Cliente"].astype(str).str.upper() == "DEFAULT"
+    if default_mask.any():
+        n_def = int(default_mask.sum())
+        logger.warning("⚠ s03b: %d linhas DEFAULT inesperadas — removendo e renormalizando", n_def)
+        df_out = df_out[~default_mask].copy()
+        s = df_out["Share"].sum()
+        if s > 0:
+            df_out["Share"] = (df_out["Share"] / s).round(6)
+
     share_sum = df_out["Share"].sum()
     logger.info("✅ %d clientes | soma share=%.6f", len(df_out), share_sum)
 

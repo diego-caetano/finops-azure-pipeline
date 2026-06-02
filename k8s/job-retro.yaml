@@ -1,0 +1,52 @@
+# One-shot Job for manual retrocharge with a custom date range.
+#
+# Usage:
+#   1. Edit RETRO_START and RETRO_END below
+#   2. kubectl delete job finops-retro -n finops --ignore-not-found=true
+#   3. kubectl apply -f k8s/job-retro.yaml
+#   4. kubectl logs -f job/finops-retro -n finops
+#
+# The job runs sh/retro_fix.py --start RETRO_START --end RETRO_END and
+# rebuilds the PBI consolidated parquet in a single batch pass at the end.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: finops-retro
+  namespace: finops
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        azure.workload.identity/use: "true"
+        app: finops-retro
+    spec:
+      serviceAccountName: finops-workload-identity-sa
+      restartPolicy: Never
+      containers:
+        - name: finops-pipeline
+          image: registrykmm.azurecr.io/finops-pipeline:latest
+          imagePullPolicy: Always
+          command: ["python", "sh/retro_fix.py"]
+          env:
+            - name: RETRO_START
+              value: "2026-05-01"
+            - name: RETRO_END
+              value: "2026-05-25"
+          envFrom:
+            - configMapRef:
+                name: finops-pipeline-config
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "16Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: ["ALL"]

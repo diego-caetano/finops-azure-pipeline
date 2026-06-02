@@ -16,10 +16,12 @@ from finops.steps import (
     s02_classify,
     s03a_dedicated,
     s03c_sql_pool,
+    s03d_backup,
     s04_client_weights,
     s05_consolidate,
     s06_fact_allocated_cost,
     s07_consolidate_pbi,
+    s08_quality_check,
 )
 
 logging.basicConfig(
@@ -57,10 +59,12 @@ _STEPS = [
     ("s02_classify", s02_classify.run),
     ("s03a_dedicated", s03a_dedicated.run),
     ("s03c_sql_pool", s03c_sql_pool.run),
+    ("s03d_backup", s03d_backup.run),
     ("s04_client_weights", s04_client_weights.run),
     ("s05_consolidate", s05_consolidate.run),
     ("s06_fact_allocated_cost", s06_fact_allocated_cost.run),
     ("s07_consolidate_pbi", s07_consolidate_pbi.run),
+    ("s08_quality_check", s08_quality_check.run),
 ]
 
 

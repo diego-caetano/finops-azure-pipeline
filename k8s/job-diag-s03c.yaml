@@ -1,0 +1,81 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: finops-diag-s03c
+  namespace: finops
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        azure.workload.identity/use: "true"
+        app: finops-diag-s03c
+    spec:
+      serviceAccountName: finops-workload-identity-sa
+      restartPolicy: Never
+      containers:
+        - name: finops-pipeline
+          image: registrykmm.azurecr.io/finops-pipeline:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -c
+            - |
+              import logging, sys
+              logging.basicConfig(
+                  level="INFO",
+                  stream=sys.stdout,
+                  format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+                  datefmt="%Y-%m-%dT%H:%M:%SZ",
+              )
+              logger = logging.getLogger("diag")
+              import os
+              from finops.storage import pipeline_client
+              from finops.utils.dates import to_partition
+
+              store = pipeline_client()
+
+              date = "2026-05-19"
+              try:
+                  # Checa fact_cost para qualquer recurso SQL
+                  df_fc = store.read_parquet(f"silver/fact_cost/{to_partition(date)}/fact_cost.parquet")
+                  logger.info("fact_cost: %d linhas | colunas: %s", len(df_fc), list(df_fc.columns))
+
+                  # Busca qualquer coisa com "sql" no ResourceType ou ResourceId
+                  sql_fc = df_fc[
+                      df_fc["ResourceType"].astype(str).str.lower().str.contains("sql", na=False) |
+                      df_fc["ResourceId"].astype(str).str.lower().str.contains("/microsoft.sql/", na=False)
+                  ]
+                  logger.info("Linhas com SQL no fact_cost: %d", len(sql_fc))
+                  for _, r in sql_fc.iterrows():
+                      logger.info("  SQL: ResourceType=%s | ResourceId=%s | Cost=%s",
+                                  r.get("ResourceType"), r.get("ResourceId"), r.get("Cost"))
+
+                  # Top 10 ResourceTypes no fact_cost (nome original do FOCUS)
+                  rt_counts = df_fc["ResourceType"].value_counts().head(10)
+                  logger.info("Top ResourceTypes no fact_cost: %s", rt_counts.to_dict())
+
+                  # Checa SubscriptionIds presentes
+                  subs = df_fc["SubscriptionId"].unique()
+                  logger.info("SubscriptionIds no fact_cost: %s", list(subs))
+              except Exception as e:
+                  logger.warning("ERRO fact_cost: %s", e)
+          envFrom:
+            - configMapRef:
+                name: finops-pipeline-config
+          env:
+            - name: LOG_LEVEL
+              value: "DEBUG"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: ["ALL"]

@@ -24,6 +24,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
+
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -56,28 +58,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from finops.storage import pipeline_client  # noqa: E402
+from finops.storage import pipeline_client, upload_csv, upload_parquet  # noqa: E402
+from finops.utils.dates import to_partition  # noqa: E402
 from finops.steps import (  # noqa: E402
     s01_ingest_focus,
     s02_classify,
     s03a_dedicated,
     s03c_sql_pool,
+    s03d_backup,
     s04_client_weights,
     s05_consolidate,
     s06_fact_allocated_cost,
-    s07_consolidate_pbi,
 )
 
 _STEPS = [
-    ("s01_ingest_focus",      s01_ingest_focus.run),
-    ("s02_classify",          s02_classify.run),
-    ("s03a_dedicated",        s03a_dedicated.run),
-    ("s03c_sql_pool",         s03c_sql_pool.run),
-    ("s04_client_weights",    s04_client_weights.run),
-    ("s05_consolidate",       s05_consolidate.run),
+    ("s01_ingest_focus",        s01_ingest_focus.run),
+    ("s02_classify",            s02_classify.run),
+    ("s03a_dedicated",          s03a_dedicated.run),
+    ("s03c_sql_pool",           s03c_sql_pool.run),
+    ("s03d_backup",             s03d_backup.run),
+    ("s04_client_weights",      s04_client_weights.run),
+    ("s05_consolidate",         s05_consolidate.run),
     ("s06_fact_allocated_cost", s06_fact_allocated_cost.run),
-    ("s07_consolidate_pbi",   s07_consolidate_pbi.run),
 ]
+
+_PBI_CONSOLIDATED_PREFIX = os.getenv("PBI_CONSOLIDATED_PREFIX", "gold/fact_allocated_cost_consolidated")
+_PBI_MANIFEST = os.getenv("PBI_MANIFEST_BLOB",          "gold/fact_allocated_cost_consolidated/manifest.csv")
+_FACT_PREFIX  = os.getenv("FACT_ALLOCATED_COST_PREFIX", "gold/fact_allocated_cost")
+_MANIFEST_COLS = ["Date", "Status", "Rows", "TotalAllocated", "TotalCost", "ProcessedAt", "PipelineRun"]
+
+
+def _monthly_blob(date_str: str) -> str:
+    return f"{_PBI_CONSOLIDATED_PREFIX}/fact_allocated_cost_{date_str[:7]}.parquet"
 
 
 def _release_memory() -> None:
@@ -97,11 +109,15 @@ def parse_args() -> tuple[str, str]:
     parser.add_argument("--end",   help="Data final   YYYY-MM-DD (inclusive)")
     args = parser.parse_args()
 
-    if bool(args.start) != bool(args.end):
-        parser.error("--start e --end devem ser usados juntos")
+    # RETRO_START/RETRO_END allow Kubernetes Jobs to set the range via env vars
+    start = args.start or os.environ.get("RETRO_START")
+    end   = args.end   or os.environ.get("RETRO_END")
 
-    if args.start and args.end:
-        return args.start, args.end
+    if bool(start) != bool(end):
+        parser.error("--start e --end devem ser usados juntos (ou RETRO_START/RETRO_END)")
+
+    if start and end:
+        return start, end
 
     today = datetime.now(BRT)
     end   = (today - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -122,10 +138,11 @@ def date_range(start: str, end: str) -> list[str]:
     return dates
 
 
-def _read_manifest_antes(store, dates: list[str]) -> dict[str, float]:
+def _read_manifest_antes(dates: list[str]) -> dict[str, float]:
     """Lê TotalAllocated do manifest atual para as datas do lote."""
     before: dict[str, float] = {}
     try:
+        store = pipeline_client()
         df = store.read_csv("gold/fact_allocated_cost_consolidated/manifest.csv")
         for _, row in df.iterrows():
             d = str(row.get("Date", "")).strip()
@@ -136,15 +153,107 @@ def _read_manifest_antes(store, dates: list[str]) -> dict[str, float]:
     return before
 
 
-def _read_total_fact_cost(store, date_str: str) -> float:
+def _read_total_fact_cost(date_str: str) -> float:
     """Lê TotalFactCost da reconciliation gerada pelo s06."""
     try:
+        store = pipeline_client()
         df = store.read_csv(
             f"gold/fact_allocated_cost/dt={date_str}/reconciliation_{date_str}.csv"
         )
         return float(df["TotalFactCost"].iloc[0])
-    except Exception:
+    except Exception as exc:
+        logger.warning("⚠ Não foi possível ler reconciliation de %s: %s", date_str, exc)
         return 0.0
+
+
+def _rebuild_consolidated_batch(pass_dates: list[str]) -> None:
+    """Rebuilds monthly PBI parquets + manifest in one pass per month.
+
+    Groups dates by year-month so each monthly file is downloaded and uploaded
+    exactly once, regardless of how many dates are in the batch.
+    Retro batches that cross a month boundary produce two monthly uploads.
+    """
+    if not pass_dates:
+        logger.info("⚠ Nenhuma data OK — skip consolidação")
+        return
+
+    store = pipeline_client()
+    storage_account = os.environ["PIPELINE_STORAGE_ACCOUNT"]
+    container = os.environ["PIPELINE_CONTAINER"]
+    pipeline_run = os.environ.get("PIPELINE_RUN_ID", "retro-fix")
+    processed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Group dates by year-month (retro que cruza virada de mês gera 2 uploads)
+    from collections import defaultdict
+    month_groups: dict[str, list[str]] = defaultdict(list)
+    for d in sorted(pass_dates):
+        month_groups[d[:7]].append(d)
+
+    manifest_rows: list[dict] = []
+
+    for year_month, dates_in_month in sorted(month_groups.items()):
+        monthly_blob = _monthly_blob(dates_in_month[0])
+        logger.info("📦 Consolidando %s (%d datas)...", year_month, len(dates_in_month))
+
+        try:
+            df_month = store.read_parquet(monthly_blob)
+            logger.info("📊 consolidado mensal existente: %d linhas", len(df_month))
+        except Exception:
+            logger.info("📊 consolidado mensal não encontrado — iniciando vazio")
+            df_month = pd.DataFrame()
+
+        if not df_month.empty:
+            df_month = df_month[~df_month["Date"].astype(str).isin(set(dates_in_month))].copy()
+
+        day_frames: list[pd.DataFrame] = []
+        for date_str in dates_in_month:
+            day_blob = f"{_FACT_PREFIX}/{to_partition(date_str)}/fact_allocated_cost_{date_str}.parquet"
+            try:
+                df_day = store.read_parquet(day_blob)
+            except Exception as exc:
+                logger.warning("⚠ Parquet não encontrado para %s: %s", date_str, exc)
+                continue
+            n_day = len(df_day)
+            total_day = float(df_day["AllocatedCost"].sum())
+
+            recon_blob = f"{_FACT_PREFIX}/{to_partition(date_str)}/reconciliation_{date_str}.csv"
+            try:
+                df_recon = store.read_csv(recon_blob)
+                total_cost = float(df_recon["TotalFactCost"].iloc[0])
+            except Exception:
+                total_cost = 0.0
+
+            day_frames.append(df_day)
+            manifest_rows.append({
+                "Date": date_str, "Status": "OK", "Rows": n_day,
+                "TotalAllocated": round(total_day, 6), "TotalCost": round(total_cost, 6),
+                "ProcessedAt": processed_at, "PipelineRun": pipeline_run,
+            })
+            logger.info("  📅 %s | %d linhas | R$ %.2f", date_str, n_day, total_day)
+
+        parts = ([] if df_month.empty else [df_month]) + day_frames
+        if not parts:
+            continue
+        df_combined = pd.concat(parts, ignore_index=True)
+
+        upload_parquet(df_combined, storage_account, container, monthly_blob)
+        n_days_out = df_combined["Date"].astype(str).nunique()
+        logger.info("⬆️  %s: %d linhas (%d datas) → %s", year_month, len(df_combined), n_days_out, monthly_blob)
+
+    if manifest_rows:
+        try:
+            df_manifest = store.read_csv(_PBI_MANIFEST)
+        except Exception:
+            df_manifest = pd.DataFrame(columns=_MANIFEST_COLS)
+        new_dates = {r["Date"] for r in manifest_rows}
+        df_manifest = df_manifest[~df_manifest["Date"].astype(str).isin(new_dates)].copy()
+        df_manifest = pd.concat(
+            [df_manifest, pd.DataFrame(manifest_rows, columns=_MANIFEST_COLS)],
+            ignore_index=True,
+        )
+        df_manifest = df_manifest.sort_values("Date", ascending=False).reset_index(drop=True)
+        upload_csv(df_manifest, storage_account, container, _PBI_MANIFEST)
+        logger.info("📋 manifest: %d entradas → %s", len(df_manifest), _PBI_MANIFEST)
 
 
 def run_date(date_str: str) -> None:
@@ -162,13 +271,12 @@ def main() -> None:
     logger.info("🔄 retro-fix: %s → %s (%d datas)", start, end, len(dates))
     logger.info("   Motivo: FOCUS billing lag — reprocessamento com dados settlados")
 
-    store = pipeline_client()
-
     logger.info("📋 Lendo manifest atual (valores antes)...")
-    before_map = _read_manifest_antes(store, dates)
+    before_map = _read_manifest_antes(dates)
 
     pass_count  = 0
     fail_count  = 0
+    pass_dates: list[str] = []
     total_antes  = 0.0
     total_depois = 0.0
 
@@ -179,14 +287,15 @@ def main() -> None:
         depois = 0.0
         try:
             run_date(date_str)
-            depois = _read_total_fact_cost(store, date_str)
+            depois = _read_total_fact_cost(date_str)
             diff_pct = ((depois - antes) / antes * 100) if antes > 0 else 0.0
             sign = "+" if diff_pct >= 0 else ""
             logger.info(
-                "✅ %s | antes=%,.2f  depois=%,.2f  (%s%.1f%%)",
-                date_str, antes, depois, sign, diff_pct,
+                "✅ %s | antes=%s  depois=%s  (%s%.1f%%)",
+                date_str, f"{antes:,.2f}", f"{depois:,.2f}", sign, diff_pct,
             )
             pass_count  += 1
+            pass_dates.append(date_str)
             total_antes  += antes
             total_depois += depois
         except Exception:
@@ -203,9 +312,16 @@ def main() -> None:
         diff_total = total_depois - total_antes
         diff_pct   = (diff_total / total_antes * 100) if total_antes > 0 else 0.0
         sign = "+" if diff_total >= 0 else ""
-        logger.info("   Total antes : %,.2f", total_antes)
-        logger.info("   Total depois: %,.2f", total_depois)
-        logger.info("   Diferença   : %s%,.2f (%s%.1f%%)", sign, diff_total, sign, diff_pct)
+        logger.info("   Total antes : %s", f"{total_antes:,.2f}")
+        logger.info("   Total depois: %s", f"{total_depois:,.2f}")
+        logger.info("   Diferença   : %s%s (%s%.1f%%)", sign, f"{diff_total:,.2f}", sign, diff_pct)
+
+    # Rebuild PBI consolidated in one batch pass (replaces per-date s07 calls)
+    logger.info("=" * 54)
+    if os.environ.get("SKIP_CONSOLIDATED_REBUILD"):
+        logger.info("⚠ SKIP_CONSOLIDATED_REBUILD=1 — consolidação PBI ignorada (modo validação)")
+    else:
+        _rebuild_consolidated_batch(pass_dates)
 
     sys.exit(0 if fail_count == 0 else 1)
 

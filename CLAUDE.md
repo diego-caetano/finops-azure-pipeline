@@ -61,10 +61,11 @@ Estrutura de pastas no container `finops-v2`:
 finops-v2/
   config/reference/
     cluster_config.csv           ← clusters AKS (tipo, URL, cliente dedicado)
-    clientes_alias.csv           ← alias namespace → cliente (89 entradas)
+    clientes_alias.csv           ← alias namespace/nome → cliente (89 entradas)
     aks_system_namespaces.csv    ← namespaces de sistema a redistribuir
     overrides_rg_auto.csv        ← padrões MC_ gerados automaticamente
     rg_tags.csv                  ← tags FINOPS-CLIENTE dos RGs (gerado diário)
+    backup_vaults.csv            ← vaults a processar pelo s03d (VaultName, ResourceGroup, SubscriptionId, ServiceKey)
 
   silver/fact_cost/dt=yyyy-MM-dd/
   silver/resource_to_service/dt=yyyy-MM-dd/
@@ -75,11 +76,15 @@ finops-v2/
     sqlpool_detail_all_<date>.csv
     sqlpool_allocation_share_all_<date>.csv
     databases_sem_tag_<date>.csv      ← databases sem tag FINOPS-CLIENTE (alocados como COMPARTILHADO)
+  gold/backup_allocation_share/dt=yyyy-MM-dd/
+    backup_share_<date>.csv           ← shares de backup para s05 (snapshots + vaults)
+    vault_detail_<date>.csv           ← auditoria de protected items por vault
+    snapshots_sem_alias_<date>.csv    ← snapshots sem alias mapeável (ficam em WEIGHT_PROPORTIONAL)
   gold/allocation_share_final/dt=yyyy-MM-dd/
   gold/fact_allocated_cost/dt=yyyy-MM-dd/
   gold/fact_allocated_cost_consolidated/
-    fact_allocated_cost_all.parquet  ← histórico completo para Power BI
-    manifest.csv                     ← uma linha por data (Status, Rows, TotalAllocated)
+    fact_allocated_cost_YYYY-MM.parquet  ← um arquivo por mês para BI (selado ao virar o mês)
+    manifest.csv                          ← uma linha por data (Status, Rows, TotalAllocated) — todos os meses
 ```
 
 ### 3. Storage do Pipeline PS atual (não tocar)
@@ -177,6 +182,12 @@ Override pós-hierarquia (aplicado sobre o resultado das 6 regras acima):
 - `ResourceType = microsoft.sql/servers/elasticpools`
   → `ServiceKey = SQLPOOL:{pool_name}` | `ServiceType = sql_pool`
   → Não é capturado por s03a (dedicado) — processado exclusivamente por s03c
+- `ResourceType = microsoft.recoveryservices/vaults`
+  → `ServiceKey = VAULT:{ResourceName}` | `ServiceType = backup_vault`
+  → Processado por s03d — rateio por protected items via ARM API
+- `ResourceType = microsoft.compute/snapshots`
+  → `ServiceType = snapshot` (ServiceKey permanece ResourceId)
+  → Processado por s03d — mapeamento direto por ResourceName → clientes_alias
 
 ---
 
@@ -205,7 +216,7 @@ Arquivo: `config/reference/cluster_config.csv`
 ```
 04:00 UTC           → s00_sync_rg_tags   (varre RGs das subscriptions → rg_tags.csv)
 05:00 UTC           → s03b_aks           (dentro de cada cluster compartilhado)
-06:00 UTC           → pipeline principal (s01→s02→s03a→s03c→s04→s05→s06→s07) — processa D-3 BRT
+06:00 UTC           → pipeline principal (s01→s02→s03a→s03c→s03d→s04→s05→s06→s07→s08) — processa D-3 BRT
 07:00 UTC (2ª-feira)→ finops-retro-fix   (reprocessa últimos 7 dias com FOCUS atualizado)
 ```
 
@@ -217,10 +228,12 @@ Arquivo: `config/reference/cluster_config.csv`
 | s03a | `finops/steps/s03a_dedicated.py` | Recursos dedicados, share=1.0 |
 | s03b | `finops/steps/s03b_aks.py` | AKS via OpenCost |
 | s03c | `finops/steps/s03c_sql_pool.py` | SQL Pool via CPU+Disk (ARM API + Azure Monitor) |
+| s03d | `finops/steps/s03d_backup.py` | Backup e Snapshots: snapshot→alias direto, vault→protected items ARM API |
 | s04 | `finops/steps/s04_client_weights.py` | Peso por cliente |
 | s05 | `finops/steps/s05_consolidate.py` | Consolida shares, valida soma=1.0 |
 | s06 | `finops/steps/s06_fact_allocated_cost.py` | AllocatedCost = BilledCost × Share, 5 outputs |
 | s07 | `finops/steps/s07_consolidate_pbi.py` | Append diário no consolidado Power BI + manifest.csv |
+| s08 | `finops/steps/s08_quality_check.py` | Alertas de qualidade: namespaces sem alias + recursos não alocados |
 
 ---
 
@@ -264,7 +277,7 @@ SQL_POOL_OUT_PREFIX=gold/sql_pool_allocation_share
 CLIENT_WEIGHTS_PREFIX=silver/client_weights
 ALLOCATION_SHARE_FINAL_PREFIX=gold/allocation_share_final
 FACT_ALLOCATED_COST_PREFIX=gold/fact_allocated_cost
-PBI_CONSOLIDATED_BLOB=gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet
+PBI_CONSOLIDATED_PREFIX=gold/fact_allocated_cost_consolidated
 PBI_MANIFEST_BLOB=gold/fact_allocated_cost_consolidated/manifest.csv
 
 # OpenCost (usado apenas no job AKS)
@@ -273,9 +286,15 @@ OPENCOST_TIMEOUT_SEC=60
 OPENCOST_RETRY_COUNT=2
 OPENCOST_RETRY_DELAY_SEC=5
 
+# Backup/Snapshots
+BACKUP_OUT_PREFIX=gold/backup_allocation_share
+
 # Pipeline
 PIPELINE_DATE=        # vazio = automático D-3 BRT (FOCUS_LAG_DAYS=3); para retrocarga manual: yyyy-MM-dd
 LOG_LEVEL=INFO
+
+# Alertas de qualidade (s08)
+QUALITY_ALERTS_PREFIX=gold/quality_alerts
 ```
 
 ---
@@ -310,9 +329,31 @@ Date;ServiceKey;Cliente;Share;DriverType;AllocationMethod
 Date;ResourceId;ServiceKey;Cliente;Cost;Share;AllocatedCost;AllocationMethod
 ```
 
-### fact_allocated_cost_all.parquet (consolidado Power BI)
-Mesmo schema do fact_allocated_cost — todas as datas em um único arquivo.
+**Mutabilidade dos arquivos diários:** o arquivo `fact_allocated_cost_<date>.parquet` em
+`gold/fact_allocated_cost/dt=<date>/` **não é imutável**. Ele é sobrescrito:
+1. **Primeiro processamento (D+3):** pipeline normal processa D-3 BRT — primeira versão do arquivo.
+2. **retro_fix (toda 2ª-feira):** reprocessa os últimos 7 dias com FOCUS mais settlado — sobrescreve com dados corrigidos.
+
+**Janela de estabilização de um arquivo diário:**
+- Arquivo para `YYYY-MM-DD` é criado em `DD+3` (pipeline D-3)
+- Considerado **estável após o retro_fix da semana seguinte** (~DD+10)
+- Para o time de dados: consumir após a segunda-feira seguinte à data garante a versão mais precisa
+
+**Fechamento do mês:** o arquivo mensal `fact_allocated_cost_YYYY-MM.parquet` recebe os últimos
+dias do mês nos primeiros dias do mês seguinte via pipeline D-3:
+- 29/05 → processado em 01/06 | 30/05 → 02/06 | 31/05 → 03/06
+
+O retro_fix da primeira segunda-feira do mês (ex: 01/06) cobre os últimos 7 dias (25–31/05)
+mas com FOCUS T+1 — ainda incompleto. A versão definitiva de cada dia vem do **pipeline D-3**
+(ex: maio/31 é definitivo após 03/06). O retro_fix da segunda-feira seguinte (ex: 08/06) já
+não cobre mais dias de maio (cobre 01–07/06). O mês está **definitivamente fechado após D+3
+do último dia** (ex: maio fecha em 03/06).
+
+### fact_allocated_cost_YYYY-MM.parquet (consolidado mensal Power BI)
+Mesmo schema do fact_allocated_cost — todas as datas do mês em um único arquivo por mês.
 Colunas extras incluídas pelo s06: `ResourceName;ResourceGroupName;ResourceType;SubscriptionId;ServiceName;DriverType`
+O arquivo mensal sofre as mesmas atualizações dos diários (D-3 + retro_fix) até ser fechado.
+`gerar_dashboard_5.py` usa env var `DASHBOARD_MONTH=YYYY-MM` para selecionar o mês (padrão: mês atual).
 
 ### manifest.csv (consolidado Power BI)
 ```
@@ -338,20 +379,22 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `finops/storage.py` — dois storage accounts; `download_csv_with_fallback()`, `upload_parquet()`, `upload_csv()`
 - [x] `finops/steps/s00_sync_rg_tags.py`
 - [x] `finops/steps/s01_ingest_focus.py` — inclui filtro `BILLING_SUBSCRIPTION_IDS` com normalização de prefixo ARM; usa `EffectiveCost` em vez de `BilledCost` (RI amortizada embutida nas linhas Usage com RG correto); filtra `EffectiveCost>0` (remove Purchase/RI sem consumo)
-- [x] `finops/steps/s02_classify.py` — hierarquia 6 regras, MC_ pattern, Tags JSON, vetorizado com np.select; elastic pools recebem `ServiceKey=SQLPOOL:{pool_name}` e `ServiceType=sql_pool`
+- [x] `finops/steps/s02_classify.py` — hierarquia 6 regras, MC_ pattern, Tags JSON, vetorizado com np.select; elastic pools → `ServiceKey=SQLPOOL:{pool_name}` + `ServiceType=sql_pool`; vaults → `ServiceKey=VAULT:{ResourceName}` + `ServiceType=backup_vault`; snapshots → `ServiceType=snapshot`
 - [x] `finops/steps/s03a_dedicated.py` — Share=1.0 por recurso dedicado
 - [x] `finops/steps/s03b_aks.py` — AKS via OpenCost; namespaces `DEFAULT` e `COMPARTILHADO` redistribuídos proporcionalmente (não entram como cliente); gera `namespaces_sem_alias_{date}.csv` para auditoria
 - [x] `finops/steps/s03c_sql_pool.py` — SQL Elastic Pools: ARM API + Monitor CPU; databases COMPARTILHADO redistribuídos proporcionalmente aos databases tagueados do mesmo pool (share calculado sobre `total_tagged_weighted`); gera `databases_sem_tag_{date}.csv` para auditoria
+- [x] `finops/steps/s03d_backup.py` — Azure Backup e Snapshots; Parte 1: snapshot→ResourceName→clientes_alias (BACKUP_SNAPSHOT_DIRECT, Share=1.0); Parte 2: vault→ARM backupProtectedItems→item count por cliente (BACKUP_VAULT_ITEMS); fallback WEIGHT_PROPORTIONAL se ARM falhar; gera `vault_detail_{date}.csv` e `snapshots_sem_alias_{date}.csv` para auditoria
 - [x] `finops/steps/s04_client_weights.py` — peso por custo dedicado, fallback igualitário
-- [x] `finops/steps/s05_consolidate.py` — consolida s03a+s03b+s03c, distribui restante por client_weights; `_read_csv_partition` filtra CSVs por `include_prefix`/`exclude_patterns` para evitar leitura de arquivos de auditoria/detalhe que não têm `AllocationMethod`
-- [x] `finops/steps/s06_fact_allocated_cost.py` — AllocatedCost = Cost × Share, 5 outputs por data; guard defensivo descarta e loga linhas residuais com `AllocationMethod=NaN`
-- [x] `finops/steps/s07_consolidate_pbi.py` — append diário idempotente + manifest.csv; TotalCost lido da reconciliation (não do campo Cost inflado); validação (linhas + TotalAllocated diff < 1.0); manifest ERROR em falha
+- [x] `finops/steps/s05_consolidate.py` — consolida s03a+s03b+s03c+s03d, distribui restante por client_weights; `_read_csv_partition` filtra CSVs por `include_prefix`/`exclude_patterns`; colapsa df_aks por `(Date, ServiceKey, Cliente)`; filtra linhas `Cliente=DEFAULT` de CSVs históricos pré-cq11; lê `backup_share_*` do prefix `BACKUP_OUT_PREFIX`
+- [x] `finops/steps/s06_fact_allocated_cost.py` — AllocatedCost = Cost × Share, 5 outputs por data; agrega fact_cost por `(Date, ResourceId, ServiceKey)` somando Cost ANTES do join com shares (elimina meter-level fan-out); guard NaN AllocationMethod; guard shares duplicados
+- [x] `finops/steps/s07_consolidate_pbi.py` — append diário idempotente + manifest.csv; TotalCost lido da reconciliation (não do campo Cost inflado); validação (linhas + TotalAllocated diff < 1.0); manifest ERROR em falha; schema alignment antes do pd.concat (schema drift protection)
+- [x] `finops/steps/s08_quality_check.py` — alertas de qualidade: agrega namespaces_sem_alias_* de todos os clusters + filtra unallocated_cost por reasons actionables (NO_SERVICEKEY, HAS_SERVICEKEY_NO_SHARE); log ⚠ + upload CSV para gold/quality_alerts/dt={date}/
 - [x] `jobs/run_aks.py`
 - [x] `jobs/run_sync_rg_tags.py`
-- [x] `jobs/run_pipeline.py` — s07 integrado como último step
+- [x] `jobs/run_pipeline.py` — ordem: s01→s02→s03a→s03c→s03d→s04→s05→s06→s07
 - [x] `sh/retro_may.py` — retrocarga original 2026-05-01 a 2026-05-15
 - [x] `sh/retro_fix_may15_20.py` — retrocarga corretiva pontual (obsoleto; substituído por retro_fix.py)
-- [x] `sh/retro_fix.py` — retrocarga corretiva genérica; aceita `--start`/`--end` ou env vars `RETRO_START`/`RETRO_END` (compatível com Kubernetes Job); compara antes/depois; executa s01→s06 por data e faz consolidação PBI em **lote único ao final** (1 download + 1 upload do consolidado, em vez de N×download+upload); `_read_manifest_antes` e `_read_total_fact_cost` criam `pipeline_client()` fresco (evita token stale)
+- [x] `sh/retro_fix.py` — retrocarga corretiva genérica; aceita `--start`/`--end` ou env vars `RETRO_START`/`RETRO_END` (compatível com Kubernetes Job); compara antes/depois; executa s01→s06 por data e faz consolidação PBI em **lote único ao final**; flag `SKIP_CONSOLIDATED_REBUILD=1` para modo validação (pula rebuild do consolidado)
 - [x] `sh/build_consolidated.py` — percorre todos os parquets em `gold/fact_allocated_cost/` e chama s07 por data
 - [x] `requirements.txt` — `azure-monitor-query==1.3.0`, `azure-mgmt-sql>=3.0.0`
 
@@ -368,9 +411,10 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 ### Configuração / referência
 - [x] `config/reference/cluster_config.csv`
 - [x] `config/reference/clientes_alias.csv`
+- [x] `config/reference/backup_vaults.csv` — vaults a processar pelo s03d (VaultName, ResourceGroup, SubscriptionId, ServiceKey)
 
 ### Infraestrutura provisionada
-- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (cq11, 2026-05-26; inclui s03b DEFAULT fix + s03c COMPARTILHADO redistribuição + s05 CSV filter + s06 NaN guard)
+- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (cq18, 2026-05-28; inclui s03d_backup + s02 vault/snapshot overrides + s05 df_backup + backup_vaults.csv com 2 vaults)
 - [x] Container `finops-v2` criado em `stpslkmmfinopseusprd`
 
 ### Clusters AKS — todos os 5 com OpenCost operacionais ✅
@@ -386,7 +430,12 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - `finops-pipeline` CronJob — 06:00 UTC ✅
 - Retrocarga original: 2026-05-01 a 2026-05-15 (15/15 OK, 100% alocado)
 - Retrocarga corretiva: 2026-05-15 a 2026-05-20 (6/6 OK) — reprocessado com FOCUS atualizado (2026-05-21)
-- Retrocarga pós-bugfix (2026-05-26): 24/24 OK — bugs SQLPOOL duplicatas + DEFAULT + COMPARTILHADO corrigidos
+- Retrocarga pós-bugfix cq11 (2026-05-26): 24/24 OK — bugs SQLPOOL duplicatas + DEFAULT + COMPARTILHADO corrigidos
+- Retrocarga pós-bugfix cq12 (2026-05-26): 24/24 OK — bug AKS fan-out inflation corrigido; consolidado: 1.596.542 linhas
+- Retrocarga cq13 (2026-05-26): 25/25 OK — inclui 2026-05-25; consolidado: 1.675.919 linhas | R$ 351.553
+- Retrocarga cq14 (2026-05-27): 25/25 OK — meter-level fan-out + DEFAULT histórico corrigidos; consolidado: **308.379 linhas** (−82%) | R$ 351.553
+- Retrocarga cq18 validação (2026-05-28): 3/3 OK (2026-05-01 a 03) — s03d validado; BACKUP_VAULT_ITEMS: R$76,73/dia (2 vaults); vault em WEIGHT_PROPORTIONAL: 0
+- Retrocarga cq18 completa (2026-05-28): **25/25 OK** — consolidado: **707.805 linhas** (25 datas) | R$ 351.552,92
 
 #### aks-prd-br-newkmm (2026-05-04)
 - Identity: `id-mg-kmm-finops-aks-prd-br-newkmm-eus-prd` (CLIENT_ID: `e67c4ddc-1e3f-451b-a9bd-b41296bf2834`)
@@ -427,13 +476,23 @@ Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 - `reconciliation_<data>.csv`
 - `unallocated_cost_<data>.csv`
 
-Consolidado Power BI — atualizado em 2026-05-26 (retrocarga completa pós-bugfix):
-- `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet`: **1.601.714 linhas**, 24 datas (2026-05-01 a 2026-05-24), Status=OK
-- Redução de ~19.823 linhas vs build anterior (1.621.537) — remoção das duplicatas SQLPOOL
-- Retrocarga 2026-05-01 a 2026-05-24: **24/24 ✅** — sem COMPARTILHADO, sem DEFAULT, sem NaN AllocationMethod
+Consolidado Power BI — atualizado em 2026-05-28 (retrocarga cq18: maio completo 01–25):
+- `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet`: **707.805 linhas**, 25 datas (2026-05-01 a 2026-05-25), Status=OK
+- Retrocarga 2026-05-01 a 2026-05-25: **25/25 ✅** — BACKUP_VAULT_ITEMS ativo (2 vaults), vault em WEIGHT_PROPORTIONAL: 0
 - `TotalCost` no manifest lido de `reconciliation_<data>.csv` (sem duplicação do fan-out)
-- Total maio (24 datas): **R$ 336.659** | média diária: **R$ 14.027**
+- Total maio (25 datas): **R$ 351.552,92** | média diária: **R$ 14.062**
 - Consolidação feita em lote único (`_rebuild_consolidated_batch`) — 1 download + 1 upload do consolidado
+
+| AllocationMethod | AllocatedCost (maio, cq18) |
+|---|---|
+| DEDICATED_TAG | ~R$ 142.654 (40,6%) |
+| SQLPOOL_CPU | ~R$ 135.914 (38,7%) |
+| WEIGHT_PROPORTIONAL | ~R$ 37.950 (10,8%) ← vaults saíram para BACKUP_VAULT_ITEMS |
+| AKS_OPENCOST | ~R$ 33.116 (9,4%) |
+| BACKUP_VAULT_ITEMS | ~R$ 1.917 (0,5%) ← kmm-prd-default-bvault-us + vault-m41c2l5l |
+| BACKUP_SNAPSHOT_DIRECT | R$ 0 (todos os snapshots de maio já tagueados → s03a) |
+
+*Totais exatos via `gerar_dashboard.py` após conectar Power BI.*
 
 ### FOCUS_LAG_DAYS = 3 — estratégia D-3 + retro semanal
 
@@ -469,6 +528,12 @@ Retrocarga corretiva 2026-05-15 a 2026-05-20 executada em 2026-05-22 (6/6 OK):
 
 ## Pendências
 
+### s03d — Backup e Snapshots ✅ operacional (cq18, 2026-05-28)
+- [x] Build cq18: `registrykmm.azurecr.io/finops-pipeline:latest` publicado (2026-05-28)
+- [x] Upload de `backup_vaults.csv` para o Blob — 2 vaults: `kmm-prd-default-bvault-us` (PRD) + `vault-m41c2l5l` (DEV)
+- [x] Validação end-to-end 2026-05-01 a 2026-05-03 — todos os 5 critérios passando; vault em WEIGHT_PROPORTIONAL: 0
+- [x] Retrocarga completa maio (2026-05-01 a 2026-05-25) com cq18 — 25/25 OK (2026-05-28); consolidado 707.805 linhas | R$ 351.552,92
+
 ### Clusters sem OpenCost (bloquear — instalar OpenCost primeiro)
 - [ ] aks-mg-kmm-dados-eus-prd — instalar OpenCost, depois seguir fluxo de identidade
 - [ ] aks-prd-emissor — migrar para OpenCost, depois seguir fluxo de identidade
@@ -486,8 +551,44 @@ Nota: `Rule` no r2s ainda mostra `TAG_RG_SHARED` (np.select não foi alterado), 
 - WEIGHT_PROPORTIONAL: R$ 1.986 (reduziu conforme esperado)
 - TotalAllocated: 100% mantido
 
-**Imagem publicada:** `registrykmm.azurecr.io/finops-pipeline:latest` (build cq11, 2026-05-26)
-**Retrocarga 2026-05-01 a 2026-05-24 concluída (24/24 ✅, 2026-05-26)** — consolidado atualizado pós-bugfix.
+**Imagem publicada:** `registrykmm.azurecr.io/finops-pipeline:latest` (build cq12, 2026-05-26)
+**Retrocarga 2026-05-01 a 2026-05-24 concluída (24/24 ✅, 2026-05-26)** — consolidado atualizado pós-bugfix (cq11 + cq12).
+
+### ~~BUG CRÍTICO — AKS fan-out inflation~~ — RESOLVIDO (2026-05-26) ✅
+
+**Problema:** recursos AKS sem namespace próprio (VMSS, Disks, LB, PVCs) recebiam N linhas por cliente (onde N = número de namespaces ativos), inflando AllocatedCost ~5x. Exemplo: `aks-poolprdkmm2-vmss` gerava 208 linhas/cliente; custo real R$192,99 vs AllocatedCost R$958,31.
+
+**Causa raiz:** CSVs históricos de s03b por namespace (1 linha por namespace em vez de 1 linha por cliente) eram lidos por s05 e concatenados ao `allocation_share_final` com múltiplos pares `(ServiceKey, Cliente)` duplicados. O join fan-out em s06 multiplicava as linhas do fact_cost.
+
+**Fix cq12 (defesa em profundidade):**
+- `s05_consolidate.py`: colapsa df_aks por `(Date, ServiceKey, Cliente)` após leitura
+- `s06_fact_allocated_cost.py`: guard antes do join colapsa pares `(ServiceKey, Cliente)` duplicados
+
+**Resultado cq12 (2026-05-26):** consolidado reduziu de 1.601.714 → 1.596.542 linhas (−5.172). Total R$336.659,40 mantido.
+
+### ~~BUG CRÍTICO — Meter-level fan-out (s06) + DEFAULT histórico (s05)~~ — RESOLVIDO (2026-05-27, cq14) ✅
+
+**PROBLEMA 1 — s06 meter fan-out:**
+- **Evidência:** `aks-poolprdkmm2-24841847-vmss` em 2026-05-01: 224 linhas FOCUS × 34 clientes = 7.072 linhas em vez de 34. AllocatedCost correto (R$514,90), mas parquet inflado 208×.
+- **Causa raiz:** `fact_cost` tem N linhas por ResourceId (1 por meter/billing line do FOCUS). O join com `df_shares` (C clientes) produzia N×C linhas. O s05/s06 dedup do cq12 colapsava os *shares*, mas o *fact_cost* permanecia com N linhas por recurso.
+- **Fix em s06:** agrega `merged_with_sk` por `(Date, ResourceId, ServiceKey)` somando Cost e usando `first()` para metadata, ANTES do join fan-out com shares. Resultado: 1 linha por (ResourceId × cliente).
+
+**PROBLEMA 2 — DEFAULT em CSVs históricos:**
+- **Evidência:** 17.403 linhas `Cliente=DEFAULT` (VMSS, Disks, LB em MC_* RGs) em todo o consolidado cq13.
+- **Causa raiz:** CSVs de s03b escritos antes do fix cq11 tinham `Cliente=DEFAULT`. O retro_fix.py não re-executa s03b — ele lê os CSVs históricos do blob. O s05 consumia esses CSVs sem filtrar DEFAULT.
+- **Fix em s05:** filtra `Cliente=DEFAULT` de `df_aks` após dedup, com warning log.
+- **Fix defensivo em s03b:** guard remove DEFAULT do output caso apareça (no-op para código atual, mas protege edge cases futuros).
+
+**Resultado cq14 (2026-05-27, validado 3 dias + retrocarga completa):**
+
+| Métrica | Antes (cq13) | Depois (cq14) |
+|---|---|---|
+| Linhas consolidado | 1.675.919 | **308.379** (−82%) |
+| VMSS linhas (maio/01) | 7.072 (224×31) | **33** |
+| DEFAULT | 17.403 | **0** |
+| AllocatedCost total | R$ 351.553 | **R$ 351.553** (idêntico) |
+
+---
 
 ### ~~3 bugs de alocação~~ — RESOLVIDOS (2026-05-26) ✅
 
@@ -509,11 +610,49 @@ Nota: `Rule` no r2s ainda mostra `TAG_RG_SHARED` (np.select não foi alterado), 
 - [x] ~~Tags numéricas~~ — investigado em 2026-05-25; zero ocorrências no consolidado de maio. Não confirmado nos dados reais — item encerrado.
 
 ### Relatórios / Power BI
-- [x] Criar arquivo consolidado `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet` — **1.601.714 linhas**, 24 datas (2026-05-01 a 2026-05-24) ✅
+- [x] Criar arquivo consolidado `gold/fact_allocated_cost_consolidated/fact_allocated_cost_all.parquet` — **308.379 linhas**, 25 datas (2026-05-01 a 2026-05-25) ✅ (cq14)
 - [x] manifest.csv com status por data — TotalCost corrigido (sem inflação do fan-out) ✅
 - [ ] Power BI — conectar direto no Blob Storage (`finops-v2`) via Azure Storage connector e apontar para o consolidado
 - [x] **Pipeline processa D-3** — `FOCUS_LAG_DAYS=3` em `finops/utils/dates.py`; log: `📅 Pipeline date: YYYY-MM-DD (D-3, FOCUS lag=3 dias)` ✅
 - [x] **CronJob `finops-retro-fix`** — toda 2ª-feira 07:00 UTC, reprocessa últimos 7 dias via `sh/retro_fix.py` ✅
+
+---
+
+## s03d — lógica de alocação Azure Backup e Snapshots
+
+### Parte 1 — Snapshots (microsoft.compute/snapshots)
+
+1. Filtra r2s por `ResourceType = microsoft.compute/snapshots` excluindo linhas com `Rule = TAG_RESOURCE/TAG_RG_INHERITED` (já tratadas por s03a)
+2. Para cada snapshot, resolve o cliente em 3 etapas:
+   - Extrai segmento de VM: `vm-{segmento}-prd-...` → `{segmento}` → busca em `clientes_alias.csv` (exact + substring)
+   - Fallback: nome completo do recurso → busca em `clientes_alias.csv`
+   - Fallback: RG → `rg_tags.csv`
+3. Se cliente encontrado → `Share=1.0`, `AllocationMethod=BACKUP_SNAPSHOT_DIRECT`
+4. Se não encontrado → snapshot permanece em WEIGHT_PROPORTIONAL (s05 o distribui por peso)
+5. Audit: `snapshots_sem_alias_{date}.csv`
+
+### Parte 2 — Recovery Services Vault
+
+1. Lê `config/reference/backup_vaults.csv` (VaultName, ResourceGroup, SubscriptionId, ServiceKey)
+2. Para cada vault → `GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.RecoveryServices/vaults/{vault}/backupProtectedItems?api-version=2023-04-01`
+3. Para cada protected item, resolve cliente: `friendlyName → alias`, então `sourceResourceId.RG → rg_tags`
+4. Items sem mapeamento → pool COMPARTILHADO redistribuído proporcionalmente (mesmo padrão do s03b)
+5. `Share = items_cliente / mapped_count` (denominador exclui COMPARTILHADO → redistributa proporcional)
+6. `AllocationMethod = BACKUP_VAULT_ITEMS` | `DriverType = BACKUP_PROTECTED_ITEMS`
+7. Fallback: se ARM API falhar → log warning, vault fica em WEIGHT_PROPORTIONAL, pipeline não aborta
+8. Audit: `vault_detail_{date}.csv` (VaultName, Cliente, ProtectedItems, TotalItems, CompartilhadoItems)
+
+**Config:** `config/reference/backup_vaults.csv` — adicionar novas linhas para novos vaults sem alterar código.
+
+**Permissões necessárias:** `Reader` nas subscriptions (já atribuído em aks-prd-newkmm identity) — suficiente para ARM list de backupProtectedItems.
+
+**Vaults configurados em `backup_vaults.csv`:**
+| VaultName | ResourceGroup | SubscriptionId | Custo/dia |
+|---|---|---|---|
+| kmm-prd-default-bvault-us | rg-kmm-backup | 52d4423b (KMM PRD) | ~R$75,60 |
+| vault-m41c2l5l | rg-dev-kmm | 3f6d197f (KMM DEV) | ~R$1,14 |
+
+**Status atual (2026-05-28):** operacional em produção (cq18). Validado 3 dias (2026-05-01 a 03). Retrocarga completa maio pendente.
 
 ---
 
@@ -577,8 +716,8 @@ kubectl logs -f job/<nome-gerado> -n finops
 
 ### Retrocarga corretiva — reprocessar dias recentes com FOCUS atualizado
 ```bash
-# Editar DATES em sh/retro_fix_may15_20.py e executar
-python sh/retro_fix_may15_20.py
+# Via script genérico (aceita --start/--end ou env vars RETRO_START/RETRO_END)
+python sh/retro_fix.py --start 2026-05-01 --end 2026-05-07
 
 # Após retrocarga corretiva, reconstruir consolidado Power BI
 kubectl delete job finops-fix-consolidated -n finops --ignore-not-found=true
@@ -606,7 +745,7 @@ print(json.dumps({'apiVersion':'batch/v1','kind':'Job','metadata':{'name':'finop
 
 ### Enviar config/reference para o Blob
 ```bash
-for f in cluster_config.csv clientes_alias.csv aks_system_namespaces.csv; do
+for f in cluster_config.csv clientes_alias.csv aks_system_namespaces.csv backup_vaults.csv; do
   az storage blob upload \
     --account-name stpslkmmfinopseusprd \
     --container-name finops-v2 \

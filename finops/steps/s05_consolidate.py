@@ -25,6 +25,7 @@ _R2S_PREFIX = os.getenv("RESOURCE_TO_SERVICE_PREFIX", "silver/resource_to_servic
 _DEDICATED_OUT_PREFIX = os.getenv("DEDICATED_OUT_PREFIX", "gold/dedicated_allocation_share")
 _AKS_OUT_PREFIX = os.getenv("AKS_OUT_PREFIX", "gold/aks_allocation_share_opencost")
 _SQL_POOL_OUT_PREFIX = os.getenv("SQL_POOL_OUT_PREFIX", "gold/sql_pool_allocation_share")
+_BACKUP_OUT_PREFIX = os.getenv("BACKUP_OUT_PREFIX", "gold/backup_allocation_share")
 _CLIENT_WEIGHTS_PREFIX = os.getenv("CLIENT_WEIGHTS_PREFIX", "silver/client_weights")
 _FINAL_PREFIX = os.getenv("ALLOCATION_SHARE_FINAL_PREFIX", "gold/allocation_share_final")
 
@@ -104,20 +105,35 @@ def run(pipeline_date: Optional[str] = None) -> None:
                 n_before, len(df_aks),
             )
 
+    # Filter DEFAULT rows from historical CSVs (pre-fix wrote DEFAULT as client)
+    if not df_aks.empty:
+        default_mask = df_aks["Cliente"].astype(str).str.upper() == "DEFAULT"
+        if default_mask.any():
+            n_def = int(default_mask.sum())
+            logger.warning(
+                "⚠ df_aks: %d linhas DEFAULT removidas (CSVs históricos pré-fix)",
+                n_def,
+            )
+            df_aks = df_aks[~default_mask].copy()
+
     df_sql = _read_csv_partition(
         store, _SQL_POOL_OUT_PREFIX, date_str,
         include_prefix="sqlpool_allocation_share_all_",
     )
+    df_backup = _read_csv_partition(
+        store, _BACKUP_OUT_PREFIX, date_str,
+        include_prefix="backup_share_",
+    )
 
-    pre_frames = [df for df in (df_dedicated, df_aks, df_sql) if not df.empty]
+    pre_frames = [df for df in (df_dedicated, df_aks, df_sql, df_backup) if not df.empty]
     pre_computed = pd.concat(pre_frames, ignore_index=True) if pre_frames else pd.DataFrame(columns=_OUTPUT_COLUMNS)
 
     pre_computed_keys: set[str] = (
         set(pre_computed["ServiceKey"].unique()) if not pre_computed.empty else set()
     )
     logger.info(
-        "📊 Pré-computados: %d keys (dedicated=%d, aks=%d, sql=%d)",
-        len(pre_computed_keys), len(df_dedicated), len(df_aks), len(df_sql),
+        "📊 Pré-computados: %d keys (dedicated=%d, aks=%d, sql=%d, backup=%d)",
+        len(pre_computed_keys), len(df_dedicated), len(df_aks), len(df_sql), len(df_backup),
     )
 
     # Load client weights for uncovered ServiceKeys
