@@ -391,19 +391,19 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `finops/steps/s08_quality_check.py` — alertas de qualidade: agrega namespaces_sem_alias_* de todos os clusters + filtra unallocated_cost por reasons actionables (NO_SERVICEKEY, HAS_SERVICEKEY_NO_SHARE); log ⚠ + upload CSV para gold/quality_alerts/dt={date}/
 - [x] `jobs/run_aks.py`
 - [x] `jobs/run_sync_rg_tags.py`
-- [x] `jobs/run_pipeline.py` — ordem: s01→s02→s03a→s03c→s03d→s04→s05→s06→s07
+- [x] `jobs/run_pipeline.py` — ordem: s01→s02→s03a→s03c→s03d→s04→s05→s06→s07→s08; try/except por step com `logger.exception()` — loga `❌ <step> falhou date=<data>` com traceback completo
 - [x] `sh/retro_may.py` — retrocarga original 2026-05-01 a 2026-05-15
 - [x] `sh/retro_fix_may15_20.py` — retrocarga corretiva pontual (obsoleto; substituído por retro_fix.py)
-- [x] `sh/retro_fix.py` — retrocarga corretiva genérica; aceita `--start`/`--end` ou env vars `RETRO_START`/`RETRO_END` (compatível com Kubernetes Job); compara antes/depois; executa s01→s06 por data e faz consolidação PBI em **lote único ao final**; flag `SKIP_CONSOLIDATED_REBUILD=1` para modo validação (pula rebuild do consolidado)
+- [x] `sh/retro_fix.py` — retrocarga corretiva genérica; aceita `--start`/`--end` ou env vars `RETRO_START`/`RETRO_END` (compatível com Kubernetes Job); compara antes/depois; executa s01→s06 por data e faz consolidação PBI em **lote único ao final**; flag `SKIP_CONSOLIDATED_REBUILD=1` para modo validação (pula rebuild do consolidado); try/except por step com `logger.exception()`
 - [x] `sh/build_consolidated.py` — percorre todos os parquets em `gold/fact_allocated_cost/` e chama s07 por data
 - [x] `requirements.txt` — `azure-monitor-query==1.3.0`, `azure-mgmt-sql>=3.0.0`
 
 ### Kubernetes / infra de código
-- [x] `k8s/cronjob-aks.yaml` — um por cluster, CLIENT_ID preenchido
-- [x] `k8s/cronjob-sync-rg-tags.yaml`
-- [x] `k8s/cronjob-pipeline.yaml` — inclui `BILLING_SUBSCRIPTION_IDS` no ConfigMap
+- [x] `k8s/cronjob-aks.yaml` — um por cluster, CLIENT_ID preenchido; anotações Grafana (`logs_enabled=true`, `logs_index=kmm-finops-newkmm-prd`)
+- [x] `k8s/cronjob-sync-rg-tags.yaml` — anotações Grafana
+- [x] `k8s/cronjob-pipeline.yaml` — inclui `BILLING_SUBSCRIPTION_IDS` no ConfigMap; anotações Grafana
+- [x] `k8s/cronjob-retro-fix.yaml` — CronJob semanal (toda 2ª-feira 07:00 UTC) que executa `sh/retro_fix.py` (últimos 7 dias); anotações Grafana
 - [x] `k8s/job-fix-consolidated.yaml` — job avulso para re-executar build_consolidated (corretivo/retroativo)
-- [x] `k8s/cronjob-retro-fix.yaml` — CronJob semanal (toda 2ª-feira 07:00 UTC) que executa `sh/retro_fix.py` (últimos 7 dias)
 - [x] `k8s/job-retro.yaml` — Job one-shot para retrocarga manual com intervalo customizado via `RETRO_START`/`RETRO_END`
 - [x] `Dockerfile` — inclui `COPY sh/ ./sh/` para expor build_consolidated.py nos pods
 - [x] `requirements.txt`
@@ -414,8 +414,9 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `config/reference/backup_vaults.csv` — vaults a processar pelo s03d (VaultName, ResourceGroup, SubscriptionId, ServiceKey)
 
 ### Infraestrutura provisionada
-- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (cq18, 2026-05-28; inclui s03d_backup + s02 vault/snapshot overrides + s05 df_backup + backup_vaults.csv com 2 vaults)
+- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (cq1a, 2026-06-03; inclui observability per-step logging + Grafana annotations nos CronJobs)
 - [x] Container `finops-v2` criado em `stpslkmmfinopseusprd`
+- [x] Repositório GitHub: `https://github.com/caetanod/finops-azure-pipeline` (privado)
 
 ### Clusters AKS — todos os 5 com OpenCost operacionais ✅
 
