@@ -28,6 +28,9 @@ spec:
           labels:
             azure.workload.identity/use: "true"
             app: finops-retro-fix
+          annotations:
+            logs_enabled: "true"
+            logs_index: "kmm-finops-newkmm-prd"
         spec:
           serviceAccountName: finops-workload-identity-sa
           restartPolicy: Never
