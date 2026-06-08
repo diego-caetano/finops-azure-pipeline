@@ -1,30 +1,21 @@
 # CronJob AKS — alocação via OpenCost
-# Aplicar individualmente em cada cluster compartilhado (kubectl apply -f ...)
-# Antes de aplicar em cada cluster, editar:
-#   - azure.workload.identity/client-id  (linha da ServiceAccount) → CLIENT_ID do cluster
-#   - CLUSTER_NAME no ConfigMap          → nome do cluster
+# Aplicar individualmente em cada cluster compartilhado (kubectl apply -f k8s/cronjob-aks.yaml)
 #
-# Cluster                         | RG              | Identity                          | CLIENT_ID
-# aks-hml-newkmm          ✅ DONE | (confirmar)     | id-mg-kmm-finops-aks-newkmm-eus-hml | 5eed8b89-7707-44cf-85e3-a6f86866a25f
-# aks-prd-newkmm                  | RG-US-PRD-KMM   | finops-aks-identity-prd-newkmm    | <preencher>
-# aks-prd-br-newkmm               | RG-PRD-KMM      | finops-aks-identity-prd-br        | <preencher>
-# aks-mg-kmm-firewall-eus-prd     | RG-US-PRD-KMM   | finops-aks-identity-firewall-prd  | <preencher>
-# aks-mg-kmm-firewall-eus-hml     | RG-DEV-KMM      | finops-aks-identity-firewall-hml  | <preencher>
+# ATENÇÃO: o ServiceAccount (finops-workload-identity-sa) é gerenciado fora deste arquivo.
+# Cada cluster tem seu próprio client-id — nunca incluir o ServiceAccount aqui para evitar
+# sobrescrever a identity errada ao rodar kubectl apply -f k8s/ no cluster central.
+# Setup inicial do SA em cada cluster (fazer uma vez):
+#   kubectl annotate serviceaccount finops-workload-identity-sa -n finops \
+#     azure.workload.identity/client-id=<CLIENT_ID_DO_CLUSTER> --overwrite
 #
-# Mudar CLUSTER_NAME para o nome do cluster onde o manifest será aplicado.
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: finops
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: finops-workload-identity-sa
-  namespace: finops
-  annotations:
-    azure.workload.identity/client-id: "5eed8b89-7707-44cf-85e3-a6f86866a25f"
+# Cluster                         | CLIENT_ID
+# aks-hml-newkmm                  | 5eed8b89-7707-44cf-85e3-a6f86866a25f
+# aks-prd-newkmm                  | 40995235-e00b-417e-83a6-4ca383f9d169
+# aks-prd-br-newkmm               | e67c4ddc-1e3f-451b-a9bd-b41296bf2834
+# aks-mg-kmm-firewall-eus-prd     | 23fe2b59-90a1-450d-8531-de76eba5340a
+# aks-mg-kmm-firewall-eus-hml     | bffedfaa-5c53-4409-988c-c6884579cebc
+#
+# Mudar CLUSTER_NAME no ConfigMap para o nome do cluster onde o manifest é aplicado.
 ---
 apiVersion: v1
 kind: ConfigMap
