@@ -2,20 +2,64 @@
 
 ## Conexão ao consolidado
 
-### Fonte principal — consolidado mensal (fact_allocated_cost_YYYY-MM.parquet)
+### Fonte principal — todos os meses via Azure Blob Storage (dinâmico)
 
-1. Power BI Desktop → **Obter dados** → **Web**
-2. Colar a URL:
+Esta abordagem carrega todos os arquivos mensais disponíveis de uma vez. O slicer de mês no relatório filtra o período sem precisar alterar a fonte.
+
+#### Passo a passo
+
+1. Power BI Desktop → **Obter dados** → **Azure** → **Armazenamento de Blobs do Azure**
+2. Em **Nome da conta ou URL**, digitar:
    ```
-   https://stpslkmmfinopseusprd.blob.core.windows.net/finops-v2/gold/fact_allocated_cost_consolidated/fact_allocated_cost_2026-05.parquet
-   ```
-   > ⚠️ O consolidado é **mensal**. Trocar `2026-05` pelo mês desejado. Para automatizar, usar parâmetro no Power Query: criar parâmetro `Mes` (texto, padrão `2026-05`) e referenciar na URL.
+   stpslkmmfinopseusprd
    ```
 3. Autenticar com **Conta Organizacional** → entrar com conta `@nstech.com.br`
-4. Clicar em **Transformar dados** (não Carregar direto)
-5. No Power Query: confirmar tipos de coluna (ver tabela abaixo)
-6. Renomear a tabela para `FactAllocatedCost`
+4. Na janela do Navegador, selecionar o container **finops-v2** → clicar em **Transformar Dados**
+5. No Power Query Editor, substituir todo o código da consulta por:
+
+```m
+let
+    Source = AzureStorage.Blobs("stpslkmmfinopseusprd"),
+    Container = Source{[Name = "finops-v2"]}[Data],
+    FilteredFiles = Table.SelectRows(
+        Container,
+        each Text.StartsWith([Name], "gold/fact_allocated_cost_consolidated/fact_allocated_cost_")
+             and Text.EndsWith([Name], ".parquet")
+    ),
+    AddParsed = Table.AddColumn(
+        FilteredFiles, "Parsed", each Parquet.Document([Content])
+    ),
+    Expanded = Table.ExpandTableColumn(
+        AddParsed, "Parsed",
+        {"Date","ResourceId","ResourceName","ResourceGroupName","ResourceType",
+         "SubscriptionId","ServiceName","ServiceKey","Cliente","Cost","Share",
+         "AllocatedCost","AllocationMethod","DriverType"}
+    ),
+    Selected = Table.SelectColumns(
+        Expanded,
+        {"Date","ResourceId","ResourceName","ResourceGroupName","ResourceType",
+         "SubscriptionId","ServiceName","ServiceKey","Cliente","Cost","Share",
+         "AllocatedCost","AllocationMethod","DriverType"}
+    ),
+    TypedDate = Table.TransformColumnTypes(Selected, {{"Date", type date}})
+in
+    TypedDate
+```
+
+6. Renomear a consulta para `FactAllocatedCost`
 7. **Fechar e Aplicar**
+
+> Cada novo mês gerado pelo pipeline aparece automaticamente na próxima atualização do relatório — nenhuma alteração na fonte é necessária.
+
+#### Slicer de mês no relatório
+
+Adicionar uma coluna calculada em `FactAllocatedCost` no Power BI:
+
+```dax
+AnoMes = FORMAT(FactAllocatedCost[Date], "YYYY-MM")
+```
+
+Inserir um **Segmentador de dados** com o campo `AnoMes` — o usuário seleciona um ou mais meses sem precisar editar a consulta.
 
 ### Segunda fonte — manifest.csv
 
@@ -72,8 +116,10 @@ Criar via DAX para habilitar filtros de período:
 
 ```dax
 DimDate =
-CALENDAR(DATE(2026, 5, 1), TODAY())
+CALENDAR(MIN(FactAllocatedCost[Date]), TODAY())
 ```
+
+> Usando `MIN(FactAllocatedCost[Date])` como início, a tabela cresce automaticamente conforme novos meses são carregados.
 
 Colunas calculadas na `DimDate`:
 
