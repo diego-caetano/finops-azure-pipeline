@@ -33,7 +33,7 @@ spec:
             - name: RETRO_START
               value: "2026-05-01"
             - name: RETRO_END
-              value: "2026-05-25"
+              value: "2026-05-31"
           envFrom:
             - configMapRef:
                 name: finops-pipeline-config
