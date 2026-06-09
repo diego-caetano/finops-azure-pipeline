@@ -274,7 +274,13 @@ def run(pipeline_date: str | None = None) -> None:
         if key in pools_seen:
             continue
         pools_seen.add(key)
-        pools.append({**info, "ServiceKey": sk})
+        # Captura o cliente dedicado do pool (se o próprio pool tiver tag FINOPS-CLIENTE)
+        dedicated_cliente = ""
+        if "EffectiveFinopsCliente" in row.index:
+            val = str(row.get("EffectiveFinopsCliente", "") or "").strip().upper()
+            if val and val != _COMPARTILHADO:
+                dedicated_cliente = val
+        pools.append({**info, "ServiceKey": sk, "DedicatedCliente": dedicated_cliente})
 
     if not pools:
         logger.info("ℹ️  Nenhum SQLPOOL encontrado no resource_to_service — nada a processar para esta data")
@@ -311,11 +317,14 @@ def run(pipeline_date: str | None = None) -> None:
         server = pool["Server"]
         pool_name = pool["Pool"]
         sk    = pool["ServiceKey"]
+        dedicated_cliente = pool.get("DedicatedCliente", "")
 
         logger.info(f"\n{'='*60}")
         logger.info(f"ServiceKey : {sk}")
         logger.info(f"Pool       : {pool_name} | Server: {server}")
         logger.info(f"Sub        : {sub}")
+        if dedicated_cliente:
+            logger.info(f"Dedicado   : {dedicated_cliente} (tag no pool — Share=1.0, sem metricas)")
 
         pool_daily_cost = daily_cost_by_sk.get(sk, 0.0)
         logger.info(f"DailyCost  : {pool_daily_cost:.6f}")
@@ -327,6 +336,39 @@ def run(pipeline_date: str | None = None) -> None:
                 "PoolDailyCost": 0, "DbCount": 0,
                 "TotalCpu": 0, "TotalDiskPct": 0, "TotalWeighted": 0,
             })
+            continue
+
+        # Pool dedicado: tag FINOPS-CLIENTE no próprio pool → 100% para esse cliente
+        # Não coleta métricas de databases — o pool inteiro pertence ao cliente tagueado
+        if dedicated_cliente:
+            all_share.append({
+                "Date":             usage_date,
+                "ServiceKey":       sk,
+                "Cliente":          dedicated_cliente,
+                "Share":            1.0,
+                "DriverType":       "SQLPOOL_DEDICATED_POOL",
+                "AllocationMethod": "DEDICATED_TAG",
+            })
+            all_detail.append({
+                "UsageDate": usage_date, "ServiceKey": sk,
+                "Pool": pool_name, "SubscriptionId": sub,
+                "ResourceGroup": rg, "Server": server,
+                "Cliente": dedicated_cliente, "Database": "(pool dedicado - sem coleta)",
+                "ResourceId": "", "CpuAvgPct": 0.0, "DiskPercentAvg": 0.0,
+                "DiskGBAvg": 0.0, "ContribCpuPct": 100.0, "ContribDiskPct": 100.0,
+                "WeightedUsage": 1.0, "Share": 1.0,
+                "AllocatedCost": pool_daily_cost,
+                "PoolDailyCost": pool_daily_cost, "DriverFallback": "",
+            })
+            all_diag.append({
+                "ServiceKey": sk, "Status": "PROCESSED_DEDICATED",
+                "PoolDailyCost": pool_daily_cost, "DbCount": 0,
+                "TotalCpu": 0, "TotalDiskPct": 0, "TotalWeighted": 1.0,
+            })
+            logger.info(
+                "OK %s — pool dedicado para %s, custo=%.2f",
+                sk, dedicated_cliente, pool_daily_cost,
+            )
             continue
 
         # Lista bancos no pool com tags ARM

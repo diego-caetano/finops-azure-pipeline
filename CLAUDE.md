@@ -659,17 +659,24 @@ Nota: `Rule` no r2s ainda mostra `TAG_RG_SHARED` (np.select não foi alterado), 
 
 ## s03c — lógica de alocação SQL Elastic Pool
 
-1. Filtra `Microsoft.Sql/servers/elasticPools` não-dedicados em `resource_to_service`
-2. Para cada pool → `GET .../elasticPools/{pool}/databases` (ARM API)
-3. Para cada database → CPU média via Azure Monitor (`cpu_percent`, agregação diária)
-4. Mapeia database → cliente via tag `FINOPS-CLIENTE` no database
-5. Databases com tag COMPARTILHADO (ou sem tag) → WeightedUsage redistribuído proporcionalmente aos clientes tagueados do mesmo pool; não geram linha em `allocation_share_final`
-6. `Share = WeightedUsage_cliente / total_tagged_weighted_pool`
+### Pool dedicado (tag FINOPS-CLIENTE no próprio pool)
+1. Verifica `EffectiveFinopsCliente` do pool em `resource_to_service`
+2. Se pool tem tag direta (≠ COMPARTILHADO, ≠ vazio) → `Share=1.0` para esse cliente, `AllocationMethod=DEDICATED_TAG`
+3. **Não chama ARM API nem Azure Monitor** — pool dedicado = custo 100% do dono da tag
+4. `DriverType = SQLPOOL_DEDICATED_POOL`
+
+### Pool compartilhado (sem tag ou tag=COMPARTILHADO)
+1. Para cada pool → `GET .../elasticPools/{pool}/databases` (ARM API)
+2. Para cada database → CPU média via Azure Monitor (`cpu_percent`, agregação diária)
+3. Mapeia database → cliente via tag `FINOPS-CLIENTE` no database
+4. Databases com tag COMPARTILHADO (ou sem tag) → WeightedUsage redistribuído proporcionalmente aos clientes tagueados do mesmo pool; não geram linha em `allocation_share_final`
+5. `Share = WeightedUsage_cliente / total_tagged_weighted_pool`
+6. `AllocationMethod = SQLPOOL_CPU`
 7. Fallback: CPU = 0 recebe peso mínimo `0.01` para não ser descartado silenciosamente
 
 **Permissões necessárias:** `Reader` nas subscriptions (já atribuído) — suficiente para ARM list e Monitor metrics.
 
-**Status atual (2026-05-22):** s03c ativo e integrado ao pipeline. Elastic pools recebem `ServiceKey=SQLPOOL:{pool_name}` e `ServiceType=sql_pool` em s02. Quando pools aparecem no FOCUS, s03c processa via ARM API + Azure Monitor. Databases sem tag `FINOPS-CLIENTE` entram como `COMPARTILHADO` no rateio proporcional (não mais como `DEFINIR`/REDISTRIBUTED_TO_CLIENTS). Audit CSV `databases_sem_tag_{date}.csv` gerado em `gold/sql_pool_allocation_share/dt={date}/` — em maio/2026, ~18 databases sem tag em 4 pools por data.
+**Status atual (2026-06-09):** Fix cq19 — pools com tag FINOPS-CLIENTE recebem `DEDICATED_TAG` + `Share=1.0` sem coleta de métricas. Pool `sqldb-elastic-pool-vcore-prd-maroni-cw` (tag=MARONI) agora aparece como custo dedicado em vez de SQLPOOL_CPU no Power BI. Retrocarga maio necessária para refletir no consolidado.
 
 ---
 
