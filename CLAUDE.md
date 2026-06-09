@@ -481,6 +481,7 @@ Consolidado Power BI — atualizado em 2026-06-09 (retrocarga cq19: maio complet
 - `TotalCost` no manifest lido de `reconciliation_<data>.csv` (sem duplicação do fan-out)
 - Consolidação feita em lote único (`_rebuild_consolidated_batch`) — 1 download + 1 upload do consolidado
 - **Arquivo antigo `fact_allocated_cost_all.parquet` está obsoleto** — Power BI deve apontar para `fact_allocated_cost_2026-05.parquet` (ou usar folder connector dinâmico — ver docs/POWER_BI.md)
+- **ATENÇÃO — Power BI mostrando Custo Dedicado MARONI = R$ 12K mesmo após cq19:** parquet verificado e está correto (`DEDICATED_TAG = R$ 61.712`, pool com `AllocationMethod=DEDICATED_TAG`). Causa: arquivo `.pbix` ainda aponta para `fact_allocated_cost_all.parquet` (obsoleto). Solução: reconectar usando o folder connector (docs/POWER_BI.md) ou apontar URL diretamente para `fact_allocated_cost_2026-05.parquet` e clicar **Atualizar**.
 
 | AllocationMethod | AllocatedCost (maio, cq19) | Obs |
 |---|---|---|
