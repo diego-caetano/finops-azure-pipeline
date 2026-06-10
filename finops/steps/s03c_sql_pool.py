@@ -46,8 +46,8 @@ RESOURCE_TO_SERVICE_PREFIX   = os.environ.get("RESOURCE_TO_SERVICE_PREFIX", "sil
 FACT_COST_PREFIX             = os.environ.get("FACT_COST_PREFIX", "silver/fact_cost")
 OUT_PREFIX                   = os.environ.get("SQL_POOL_OUT_PREFIX", "gold/sql_pool_allocation_share")
 
-CPU_WEIGHT  = float(os.environ.get("SQL_CPU_WEIGHT",  "0.97"))
-DISK_WEIGHT = float(os.environ.get("SQL_DISK_WEIGHT", "0.03"))
+CPU_WEIGHT  = float(os.environ.get("SQL_CPU_WEIGHT",  "0.70"))
+DISK_WEIGHT = float(os.environ.get("SQL_DISK_WEIGHT", "0.30"))
 
 _COMPARTILHADO = "COMPARTILHADO"
 
@@ -449,18 +449,18 @@ def run(pipeline_date: str | None = None) -> None:
             all_diag.append({
                 "ServiceKey": sk, "Status": "SKIPPED_NO_DETAIL",
                 "PoolDailyCost": pool_daily_cost, "DbCount": 0,
-                "TotalCpu": 0, "TotalDiskPct": 0, "TotalWeighted": 0,
+                "TotalCpu": 0, "TotalDiskGB": 0, "TotalWeighted": 0,
             })
             continue
 
-        total_cpu  = sum(r["CpuAvgPct"]      for r in detail_rows)
-        total_disk = sum(r["DiskPercentAvg"] for r in detail_rows)
-        logger.info(f"TotalCpu={total_cpu:.4f} | TotalDisk={total_disk:.4f}")
+        total_cpu     = sum(r["CpuAvgPct"] for r in detail_rows)
+        total_disk_gb = sum(r["DiskGBAvg"] for r in detail_rows)
+        logger.info(f"TotalCpu={total_cpu:.4f} | TotalDiskGB={total_disk_gb:.4f}")
 
-        # Calcula WeightedUsage por banco
+        # Calcula WeightedUsage por banco (storage em GB absolutos — proporcional real)
         for r in detail_rows:
-            contrib_cpu  = (r["CpuAvgPct"]      / total_cpu  * 100) if total_cpu  > 0 else 0.0
-            contrib_disk = (r["DiskPercentAvg"] / total_disk * 100) if total_disk > 0 else 0.0
+            contrib_cpu  = (r["CpuAvgPct"] / total_cpu     * 100) if total_cpu     > 0 else 0.0
+            contrib_disk = (r["DiskGBAvg"] / total_disk_gb * 100) if total_disk_gb > 0 else 0.0
             weighted = (contrib_cpu * CPU_WEIGHT) + (contrib_disk * DISK_WEIGHT)
             r["ContribCpuPct"]  = round(contrib_cpu, 4)
             r["ContribDiskPct"] = round(contrib_disk, 4)
@@ -536,7 +536,7 @@ def run(pipeline_date: str | None = None) -> None:
             "PoolDailyCost": pool_daily_cost,
             "DbCount": len(detail_rows),
             "TotalCpu": total_cpu,
-            "TotalDiskPct": total_disk,
+            "TotalDiskGB": total_disk_gb,
             "TotalWeighted": total_weighted,
         })
         logger.info(

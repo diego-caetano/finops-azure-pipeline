@@ -414,7 +414,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - [x] `config/reference/backup_vaults.csv` — vaults a processar pelo s03d (VaultName, ResourceGroup, SubscriptionId, ServiceKey)
 
 ### Infraestrutura provisionada
-- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (cq1b, 2026-06-09; fix s03c pool dedicado → DEDICATED_TAG)
+- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build publicado (cq1c, 2026-06-09; fix s03c storage metric DiskPercentAvg → DiskGBAvg + pesos 70/30)
 - [x] Container `finops-v2` criado em `stpslkmmfinopseusprd`
 - [x] Repositório GitHub: `https://github.com/caetanod/finops-azure-pipeline` (privado)
 
@@ -438,6 +438,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 - Retrocarga cq18 validação (2026-05-28): 3/3 OK (2026-05-01 a 03) — s03d validado; BACKUP_VAULT_ITEMS: R$76,73/dia (2 vaults); vault em WEIGHT_PROPORTIONAL: 0
 - Retrocarga cq18 completa (2026-05-28): **25/25 OK** — consolidado: **707.805 linhas** (25 datas) | R$ 351.552,92
 - Retrocarga cq19 completa (2026-06-09): **31/31 OK** — consolidado: **905.849 linhas** (maio completo 01–31) | fix s03c pool dedicado MARONI (SQLPOOL_CPU → DEDICATED_TAG)
+- Retrocarga cq1c completa (2026-06-09): **31/31 OK** — consolidado: **905.865 linhas** (maio completo 01–31) | fix s03c storage metric DiskPercentAvg → DiskGBAvg + pesos 70/30
 
 #### aks-prd-br-newkmm (2026-05-04)
 - Identity: `id-mg-kmm-finops-aks-prd-br-newkmm-eus-prd` (CLIENT_ID: `e67c4ddc-1e3f-451b-a9bd-b41296bf2834`)
@@ -455,7 +456,7 @@ de custo real — shares somam 1.0 por recurso, então AllocatedCost total == cu
 
 ---
 
-## Validação do pipeline (2026-06-09, cq19 — maio completo)
+## Validação do pipeline (2026-06-09, cq1c — maio completo)
 
 Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 
@@ -466,7 +467,7 @@ Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 | Custo médio diário | ~R$ 13.400–15.700/dia (dados settlados) |
 | Total maio (31 datas, 01–31) | **~R$ 458K** (estimativa) | média diária: **~R$ 14.780** |
 | AKS_OPENCOST | Ativo — R$ ~1.500/dia via consumo real de namespace |
-| SQLPOOL | Ativo — 7 pools; 1 pool dedicado (MARONI) → DEDICATED_TAG; 6 pools compartilhados → SQLPOOL_CPU por CPU |
+| SQLPOOL | Ativo — 8 pools; 1 pool dedicado (MARONI) → DEDICATED_TAG; 7 pools compartilhados → SQLPOOL_CPU por CPU+DiskGB |
 | EffectiveCost | Usado em vez de BilledCost — RI amortizada embutida nas linhas Usage; Purchase (EffectiveCost=0) filtrado |
 
 5 outputs do s06 por data em `gold/fact_allocated_cost/dt=<data>/`:
@@ -476,26 +477,27 @@ Pipeline validado end-to-end com escopo correto (apenas subscriptions KMM):
 - `reconciliation_<data>.csv`
 - `unallocated_cost_<data>.csv`
 
-Consolidado Power BI — atualizado em 2026-06-09 (retrocarga cq19: maio completo 01–31):
-- `gold/fact_allocated_cost_consolidated/fact_allocated_cost_2026-05.parquet`: **905.849 linhas**, 31 datas (2026-05-01 a 2026-05-31), Status=OK
+Consolidado Power BI — atualizado em 2026-06-09 (retrocarga cq1c: maio completo 01–31):
+- `gold/fact_allocated_cost_consolidated/fact_allocated_cost_2026-05.parquet`: **905.865 linhas**, 31 datas (2026-05-01 a 2026-05-31), Status=OK
 - `TotalCost` no manifest lido de `reconciliation_<data>.csv` (sem duplicação do fan-out)
 - Consolidação feita em lote único (`_rebuild_consolidated_batch`) — 1 download + 1 upload do consolidado
 - **Arquivo antigo `fact_allocated_cost_all.parquet` está obsoleto** — Power BI deve apontar para `fact_allocated_cost_2026-05.parquet` (ou usar folder connector dinâmico — ver docs/POWER_BI.md)
-- **ATENÇÃO — Power BI mostrando Custo Dedicado MARONI = R$ 12K mesmo após cq19:** parquet verificado e está correto (`DEDICATED_TAG = R$ 61.712`, pool com `AllocationMethod=DEDICATED_TAG`). Causa: arquivo `.pbix` ainda aponta para `fact_allocated_cost_all.parquet` (obsoleto). Solução: reconectar usando o folder connector (docs/POWER_BI.md) ou apontar URL diretamente para `fact_allocated_cost_2026-05.parquet` e clicar **Atualizar**.
+- **ATENÇÃO — Power BI mostrando Custo Dedicado MARONI = R$ 12K:** parquet correto (`DEDICATED_TAG = R$ 61.712`). Causa: `.pbix` aponta para `fact_allocated_cost_all.parquet` (obsoleto). Solução: reconectar via folder connector (docs/POWER_BI.md) ou apontar URL diretamente para `fact_allocated_cost_2026-05.parquet`.
 
-| AllocationMethod | AllocatedCost (maio, cq19) | Obs |
+| AllocationMethod | AllocatedCost (maio, cq1c) | Obs |
 |---|---|---|
-| DEDICATED_TAG | aumentou vs cq18 | inclui agora pool dedicado MARONI (`sqldb-elastic-pool-vcore-prd-maroni-cw`) |
-| SQLPOOL_CPU | reduziu vs cq18 | apenas pools compartilhados; pool MARONI saiu deste bucket |
-| WEIGHT_PROPORTIONAL | ~R$ 37.950 | vaults em BACKUP_VAULT_ITEMS |
+| DEDICATED_TAG | R$ 61.712,98 MARONI | inclui pool dedicado MARONI (`sqldb-elastic-pool-vcore-prd-maroni-cw`) |
+| SQLPOOL_CPU | — | pools compartilhados; rateado por CPU(70%) + DiskGB(30%) |
+| WEIGHT_PROPORTIONAL | ~R$ 37.950 | recursos sem classificação específica |
 | AKS_OPENCOST | ~R$ 33.116 | namespace por cluster |
 | BACKUP_VAULT_ITEMS | ~R$ 1.917 | kmm-prd-default-bvault-us + vault-m41c2l5l |
 | BACKUP_SNAPSHOT_DIRECT | R$ 0 | snapshots de maio tagueados → s03a |
 
-**Reconciliação MARONI (cq19):**
+**Reconciliação MARONI (cq1c):**
 - Azure Cost Management (tag=MARONI, maio): R$ 62.634
-- Pipeline DEDICATED_TAG (após cq19): ~R$ 61.713 (recursos diretos + pool dedicado)
-- Diferença residual ~R$ 921: EffectiveCost vs BilledCost (amortização RI) ✅
+- Pipeline DEDICATED_TAG (após cq1c): R$ 61.712,98 (recursos diretos + pool dedicado)
+- Pipeline TOTAL MARONI maio: R$ 68.725,75 (inclui WEIGHT_PROPORTIONAL + AKS_OPENCOST + SQLPOOL_CPU outros pools)
+- Diferença DEDICATED_TAG vs Cost Management ~R$ 921: EffectiveCost vs BilledCost (amortização RI) ✅
 
 *Totais exatos via Power BI após atualizar fonte para `fact_allocated_cost_2026-05.parquet`.*
 
@@ -688,9 +690,15 @@ Nota: `Rule` no r2s ainda mostra `TAG_RG_SHARED` (np.select não foi alterado), 
 6. `AllocationMethod = SQLPOOL_CPU`
 7. Fallback: CPU = 0 recebe peso mínimo `0.01` para não ser descartado silenciosamente
 
+**Métricas e pesos (cq1c):**
+- CPU: `cpu_percent` via Azure Monitor — peso configurável via `SQL_CPU_WEIGHT` (padrão: **0.70**)
+- Storage: `storage_used` via Azure Monitor em **GB absolutos** (`DiskGBAvg`) — peso `SQL_DISK_WEIGHT` (padrão: **0.30**)
+- `WeightedUsage = contrib_cpu_pct * 0.70 + contrib_disk_pct * 0.30` — aproxima estrutura de custo real vCore Azure (70% compute / 30% storage)
+- Antes (cq19): storage usava `DiskPercentAvg` (% do max configurado por DB — enganoso); corrigido para `DiskGBAvg` (bytes absolutos — comparação justa entre DBs)
+
 **Permissões necessárias:** `Reader` nas subscriptions (já atribuído) — suficiente para ARM list e Monitor metrics.
 
-**Status atual (2026-06-09):** Fix cq19 — pools com tag FINOPS-CLIENTE recebem `DEDICATED_TAG` + `Share=1.0` sem coleta de métricas. Pool `sqldb-elastic-pool-vcore-prd-maroni-cw` (tag=MARONI) agora aparece como custo dedicado em vez de SQLPOOL_CPU no Power BI. Retrocarga maio necessária para refletir no consolidado.
+**Status atual (2026-06-09, cq1c):** pools com tag FINOPS-CLIENTE recebem `DEDICATED_TAG` + `Share=1.0` sem métricas. Pools compartilhados: rateado por CPU(70%) + DiskGB(30%). Retrocarga maio 01–31 concluída (905.865 linhas). Pool MARONI: `DEDICATED_TAG / SQLPOOL_DEDICATED_POOL = R$ 49.049,75` ✅
 
 ---
 
