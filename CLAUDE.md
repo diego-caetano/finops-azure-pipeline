@@ -244,9 +244,16 @@ resource_to_service:
 allocation_share_final:
   Date;ServiceKey;Cliente;Share;DriverType;AllocationMethod
 
-fact_allocated_cost:
-  Date;ResourceId;ServiceKey;Cliente;Cost;Share;AllocatedCost;AllocationMethod
-  (+ colunas extras no consolidado mensal: ResourceName;ResourceGroupName;ResourceType;SubscriptionId;ServiceName;DriverType)
+fact_allocated_cost (diário e consolidado mensal — mesmo schema):
+  Date;ResourceId;ResourceName;ResourceGroupName;ResourceType;SubscriptionId;
+  ServiceName;ServiceKey;Cliente;Cost;Share;AllocatedCost;AllocationMethod;DriverType
+
+  Granularidade: 1 linha = (Date, ResourceId, ServiceKey, Cliente)
+  ResourceName = nome do recurso Azure de billing em todos os métodos:
+    DEDICATED_TAG      → recurso dedicado (1 cliente)
+    SQLPOOL_CPU        → nome do pool (não do database)
+    AKS_OPENCOST       → nome do node/VM de billing (namespace está no ServiceKey)
+    WEIGHT_PROPORTIONAL→ recurso compartilhado (aparece N vezes, 1 por cliente)
 
 manifest.csv:
   Date;Status;Rows;TotalAllocated;TotalCost;ProcessedAt;PipelineRun

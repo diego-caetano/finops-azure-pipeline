@@ -58,10 +58,23 @@ def run(pipeline_date: Optional[str] = None) -> None:
         n_ns = len(df_ns)
         cost_ns = float(df_ns["UnmappedCost"].sum()) if "UnmappedCost" in df_ns.columns else 0.0
         n_clusters = df_ns["Cluster"].nunique() if "Cluster" in df_ns.columns else len(alias_blobs)
+
+        if "Cluster" in df_ns.columns and "Namespace" in df_ns.columns:
+            def _fmt_ns_row(row: pd.Series) -> str:
+                suffix = " [⚙ candidato sistema?]" if row.get("CandidatoSistema") else ""
+                return f"  - {row['Cluster']}/{row['Namespace']} (R${row.get('UnmappedCost', 0):.2f}){suffix}"
+
+            ns_lines = "\n".join(
+                _fmt_ns_row(row)
+                for _, row in df_ns.sort_values(["Cluster", "Namespace"]).iterrows()
+            )
+        else:
+            ns_lines = "  (detalhes indisponíveis)"
+
         logger.warning(
             "⚠ NAMESPACE_SEM_ALIAS: %d namespaces em %d cluster(s) | custo redistribuído=R$%.2f"
-            " | Ação: adicionar em config/reference/clientes_alias.csv",
-            n_ns, n_clusters, cost_ns,
+            " | Ação: adicionar em config/reference/clientes_alias.csv\nNamespaces:\n%s",
+            n_ns, n_clusters, cost_ns, ns_lines,
         )
         blob_ns = f"{_QUALITY_PREFIX}/{partition}/namespaces_sem_alias_{date_str}.csv"
         upload_csv(df_ns, storage_account, container, blob_ns)

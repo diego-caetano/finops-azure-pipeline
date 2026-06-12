@@ -78,6 +78,22 @@ def _is_system(ns: str, system_df: pd.DataFrame) -> bool:
     return False
 
 
+_SYSTEM_CANDIDATE_PATTERNS = {
+    "kube", "monitoring", "logging", "cert-manager", "ingress", "nginx",
+    "flux", "argocd", "istio", "linkerd", "prometheus", "grafana",
+    "elastic", "loki", "jaeger", "vault", "external-secrets", "sealed-secrets",
+    "crossplane", "velero", "trivy", "falco", "gatekeeper", "opa", "tekton",
+    "calico", "cilium", "coredns", "metrics-server", "cluster-autoscaler",
+    "reloader", "reflector", "kubeops",
+}
+
+
+def _is_system_candidate(ns: str) -> bool:
+    """Heuristic: namespace name suggests infra/system, not a business client."""
+    ns_lower = ns.lower()
+    return any(p in ns_lower for p in _SYSTEM_CANDIDATE_PATTERNS)
+
+
 def _resolve_client(ns: str, alias_df: pd.DataFrame) -> Optional[str]:
     """Return cliente name by matching namespace against alias table, or None."""
     ns_lower = ns.lower()
@@ -154,6 +170,7 @@ def run(pipeline_date: Optional[str] = None) -> None:
                 "UnmappedCost": round(cost, 6),
                 "AliasResolvido": cliente or "",
                 "RedistribuidoPara": "system_bucket",
+                "CandidatoSistema": _is_system_candidate(ns),
             })
 
     # Accumulate all system cost (infra + unmapped)
