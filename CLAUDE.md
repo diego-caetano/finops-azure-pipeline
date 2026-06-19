@@ -128,9 +128,9 @@ Override pós-hierarquia:
 |---|---|---|
 | aks-prd-newkmm | RG-US-PRD-KMM | ✅ http://10.152.26.15:9003 |
 | aks-prd-br-newkmm | RG-PRD-KMM | ✅ http://10.151.24.6:9003 |
-| aks-hml-newkmm | (confirmar) | ✅ http://10.152.12.117:9003 |
+| aks-hml-newkmm | RG-US-PRD-KMM | ✅ http://10.152.12.117:9003 — OPENCOST_TIMEOUT_SEC=180 (ConfigMap local; cluster spot tem muitos nós) |
 | aks-mg-kmm-firewall-eus-prd | RG-US-PRD-KMM | ✅ http://10.152.51.4:9003 |
-| aks-mg-kmm-firewall-eus-hml | RG-DEV-KMM | ✅ http://10.153.6.6:9003 |
+| aks-mg-kmm-firewall-eus-hml | RG-DEV-KMM (sub: 3f6d197f — usar `--subscription 3f6d197f-f70b-4c2c-b981-8bb575d47a7a`) | ✅ http://10.153.6.6:9003 |
 | aks-mg-kmm-dados-eus-prd | (confirmar) | ❌ pendente instalação |
 | aks-prd-emissor | (confirmar) | ❌ pendente migração |
 | aks-mg-kmm-win-eus-hml | (confirmar) | ❌ pendente instalação |
@@ -153,14 +153,14 @@ Override pós-hierarquia:
 | s01 | `finops/steps/s01_ingest_focus.py` | Lê FOCUS parquet → fact_cost; usa `EffectiveCost` (não BilledCost) |
 | s02 | `finops/steps/s02_classify.py` | Classifica recursos → resource_to_service |
 | s03a | `finops/steps/s03a_dedicated.py` | Recursos dedicados, share=1.0 |
-| s03b | `finops/steps/s03b_aks.py` | AKS via OpenCost; DEFAULT/COMPARTILHADO redistribuídos |
+| s03b | `finops/steps/s03b_aks.py` | AKS via OpenCost; DEFAULT/COMPARTILHADO redistribuídos; fallback para shares históricos (`AKS_OPENCOST_CACHED`) se OpenCost indisponível |
 | s03c | `finops/steps/s03c_sql_pool.py` | SQL Pool: pool dedicado → DEDICATED_TAG; compartilhado → CPU(70%)+DiskGB(30%) |
 | s03d | `finops/steps/s03d_backup.py` | Snapshots → alias direto; Vaults → protected items ARM API |
 | s04 | `finops/steps/s04_client_weights.py` | Peso por cliente |
 | s05 | `finops/steps/s05_consolidate.py` | Consolida shares, valida soma=1.0 |
 | s06 | `finops/steps/s06_fact_allocated_cost.py` | AllocatedCost = BilledCost × Share; agrega fact_cost por ResourceId ANTES do join |
 | s07 | `finops/steps/s07_consolidate_pbi.py` | Append diário idempotente + manifest.csv |
-| s08 | `finops/steps/s08_quality_check.py` | Alertas de qualidade: namespaces sem alias + recursos não alocados |
+| s08 | `finops/steps/s08_quality_check.py` | Alertas de qualidade: (1) namespaces sem alias, (2) recursos não alocados, (3) clusters AKS usando shares cacheados (`AKS_OPENCOST_CACHED`) |
 
 **FOCUS_LAG_DAYS = 3** (em `finops/utils/dates.py`): pipeline processa D-3; retro_fix semanal cobre lags maiores.
 
@@ -213,7 +213,7 @@ QUALITY_ALERTS_PREFIX=gold/quality_alerts
 
 # OpenCost (usado apenas no job AKS)
 OPENCOST_ENDPOINT=http://opencost.opencost.svc:9003
-OPENCOST_TIMEOUT_SEC=60
+OPENCOST_TIMEOUT_SEC=60   # padrão; aks-hml-newkmm tem 180 no ConfigMap local (cluster com muitos nodes spot)
 OPENCOST_RETRY_COUNT=2
 OPENCOST_RETRY_DELAY_SEC=5
 
@@ -250,10 +250,11 @@ fact_allocated_cost (diário e consolidado mensal — mesmo schema):
 
   Granularidade: 1 linha = (Date, ResourceId, ServiceKey, Cliente)
   ResourceName = nome do recurso Azure de billing em todos os métodos:
-    DEDICATED_TAG      → recurso dedicado (1 cliente)
-    SQLPOOL_CPU        → nome do pool (não do database)
-    AKS_OPENCOST       → nome do node/VM de billing (namespace está no ServiceKey)
-    WEIGHT_PROPORTIONAL→ recurso compartilhado (aparece N vezes, 1 por cliente)
+    DEDICATED_TAG          → recurso dedicado (1 cliente)
+    SQLPOOL_CPU            → nome do pool (não do database)
+    AKS_OPENCOST           → nome do node/VM de billing (namespace está no ServiceKey)
+    AKS_OPENCOST_CACHED    → mesmo que AKS_OPENCOST, mas OpenCost estava indisponível; shares do dia anterior reutilizados
+    WEIGHT_PROPORTIONAL    → recurso compartilhado (aparece N vezes, 1 por cliente)
 
 manifest.csv:
   Date;Status;Rows;TotalAllocated;TotalCost;ProcessedAt;PipelineRun
@@ -273,14 +274,14 @@ manifest.csv:
 - [x] `finops/steps/s01_ingest_focus.py` — `EffectiveCost` (não BilledCost); filtra `EffectiveCost>0`; normaliza ARM prefix
 - [x] `finops/steps/s02_classify.py` — 6 regras, MC_ pattern, elastic pools/vaults/snapshots override
 - [x] `finops/steps/s03a_dedicated.py`
-- [x] `finops/steps/s03b_aks.py` — DEFAULT/COMPARTILHADO redistribuídos; gera `namespaces_sem_alias_{date}.csv`
+- [x] `finops/steps/s03b_aks.py` — DEFAULT/COMPARTILHADO redistribuídos; gera `namespaces_sem_alias_{date}.csv`; fallback `_load_last_known_shares` quando OpenCost indisponível (→ `AKS_OPENCOST_CACHED`, nunca WEIGHT_PROPORTIONAL)
 - [x] `finops/steps/s03c_sql_pool.py` — pool dedicado → DEDICATED_TAG sem API; compartilhado → CPU(70%)+DiskGB(30%); gera `databases_sem_tag_{date}.csv`
 - [x] `finops/steps/s03d_backup.py` — snapshot→alias; vault→ARM backupProtectedItems; fallback WEIGHT_PROPORTIONAL; gera audit CSVs
 - [x] `finops/steps/s04_client_weights.py`
 - [x] `finops/steps/s05_consolidate.py` — `_read_csv_partition` com include/exclude; colapsa AKS por (Date,ServiceKey,Cliente); filtra DEFAULT histórico
 - [x] `finops/steps/s06_fact_allocated_cost.py` — agrega fact_cost por ResourceId ANTES do join (meter fan-out guard); 5 outputs
 - [x] `finops/steps/s07_consolidate_pbi.py` — append idempotente; TotalCost via reconciliation; schema alignment
-- [x] `finops/steps/s08_quality_check.py`
+- [x] `finops/steps/s08_quality_check.py` — 3 checks: (1) NAMESPACE_SEM_ALIAS com lista compacta numa linha (campo `Ocorrências:` no e-mail), (2) RECURSO_NAO_ALOCADO, (3) AKS_OPENCOST_CACHED
 - [x] `jobs/run_pipeline.py`, `jobs/run_aks.py`, `jobs/run_sync_rg_tags.py`
 - [x] `sh/retro_fix.py` — aceita `--start`/`--end` ou `RETRO_START`/`RETRO_END`; consolidação PBI em lote único ao final
 - [x] `sh/build_consolidated.py`
@@ -291,7 +292,7 @@ manifest.csv:
 - [x] `k8s/job-fix-consolidated.yaml`, `k8s/job-retro.yaml`
 
 ### Infraestrutura
-- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build cq1d (2026-06-10)
+- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build cq1h (2026-06-19)
 - [x] 5 clusters AKS com OpenCost e CronJobs aplicados
 - [x] Consolidado maio: `fact_allocated_cost_2026-05.parquet` (905.865 linhas, 31 datas) ✅
 
@@ -306,6 +307,33 @@ manifest.csv:
 
 ### Power BI
 - [ ] Reconectar `.pbix` via folder connector para `fact_allocated_cost_YYYY-MM.parquet` — ver `docs/POWER_BI.md`
+
+---
+
+## s03b — resiliência quando OpenCost está indisponível
+
+Quando `_fetch_allocations` falha após todas as retentativas, o step **não usa WEIGHT_PROPORTIONAL** (injusto: cobraria clientes que não consomem aquele cluster). Em vez disso:
+
+1. Chama `_load_last_known_shares(store, prefix, cluster_name, current_date)`
+2. Lista `gold/aks_allocation_share_opencost/` e busca o arquivo mais recente de `{cluster_name}.csv` excluindo a data atual
+3. Reutiliza os shares com `AllocationMethod=AKS_OPENCOST_CACHED` e `DriverType=OPENCOST_NAMESPACE_CACHED`
+4. Grava o arquivo do dia atual no blob — o pipeline principal processa normalmente
+5. Se não existir histórico, loga `❌` e não grava nada — o cluster fica sem alocação AKS para o dia
+
+O s08 detecta arquivos com `AKS_OPENCOST_CACHED` e dispara alerta:
+```
+⚠ AKS_OPENCOST_CACHED: 1 cluster(s) usando shares históricos | Clusters: aks-hml-newkmm | Ação: verificar pods OpenCost
+```
+
+**aks-hml-newkmm — timeout especial:** cluster spot com ~30+ nós; OpenCost leva ~167s para computar alocações históricas.
+`OPENCOST_TIMEOUT_SEC=180` aplicado diretamente no ConfigMap `finops-aks-config` no cluster (não alterar o cronjob-aks.yaml padrão).
+
+```bash
+# Verificar/replicar o override de timeout em aks-hml-newkmm:
+kubectl config use-context aks-hml-newkmm
+kubectl get configmap finops-aks-config -n finops -o jsonpath='{.data.OPENCOST_TIMEOUT_SEC}'
+# Deve retornar: 180
+```
 
 ---
 

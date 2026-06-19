@@ -9,6 +9,7 @@ namespace → cliente via clientes_alias.csv e grava os shares no storage.
 
 import logging
 import os
+import re
 import time
 from typing import Optional
 
@@ -58,6 +59,41 @@ def _fetch_allocations(endpoint: str, date_str: str) -> dict[str, float]:
                 logger.warning("⚠ OpenCost tentativa %d falhou: %s — aguardando %.1fs", attempt, exc, wait)
                 time.sleep(wait)
     raise last_exc  # type: ignore[misc]
+
+
+# ------------------------------------------------------------------
+# Cached share fallback
+# ------------------------------------------------------------------
+
+def _load_last_known_shares(
+    store, prefix: str, cluster_name: str, current_date: str
+) -> tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Return (df, last_date) using the most recent valid share for this cluster.
+
+    Looks back up to 7 days. Returns (None, None) if no history exists.
+    Used when OpenCost is unavailable so allocation stays fair (only charges
+    clients who actually run workloads on this cluster).
+    """
+    try:
+        all_blobs = store.list_blobs(f"{prefix}/")
+        cluster_file = f"/{cluster_name}.csv"
+        candidates = sorted(
+            [
+                b for b in all_blobs
+                if b.endswith(cluster_file) and f"dt={current_date}" not in b
+            ],
+            reverse=True,
+        )
+        if not candidates:
+            return None, None
+        latest_blob = candidates[0]
+        m = re.search(r"dt=(\d{4}-\d{2}-\d{2})", latest_blob)
+        last_date = m.group(1) if m else "desconhecido"
+        df = store.read_csv(latest_blob)
+        return df, last_date
+    except Exception as exc:
+        logger.warning("⚠ Não foi possível carregar shares históricos para %s: %s", cluster_name, exc)
+        return None, None
 
 
 # ------------------------------------------------------------------
@@ -127,7 +163,33 @@ def run(pipeline_date: Optional[str] = None) -> None:
     # ServiceKey é construído a partir de CLUSTER_NAME; não precisa ler cluster_config.csv
     # (cluster_config.csv é referência estática usada por outros steps)
 
-    ns_costs = _fetch_allocations(endpoint, date_str)
+    try:
+        ns_costs = _fetch_allocations(endpoint, date_str)
+    except Exception as exc:
+        logger.error(
+            "❌ OpenCost indisponível para %s após %d tentativas: %s",
+            cluster_name, _OC_RETRIES + 1, exc,
+        )
+        df_cached, last_date = _load_last_known_shares(store, _AKS_OUT_PREFIX, cluster_name, date_str)
+        if df_cached is not None and not df_cached.empty:
+            df_cached = df_cached.copy()
+            df_cached["Date"] = date_str
+            df_cached["AllocationMethod"] = "AKS_OPENCOST_CACHED"
+            df_cached["DriverType"] = "OPENCOST_NAMESPACE_CACHED"
+            blob_name = f"{_AKS_OUT_PREFIX}/{to_partition(date_str)}/{cluster_name}.csv"
+            store.write_csv(blob_name, df_cached)
+            logger.warning(
+                "⚠ AKS_OPENCOST_CACHED: %s usando shares de %s (OpenCost indisponível)"
+                " — rateio baseado em uso histórico, não em tempo real",
+                cluster_name, last_date,
+            )
+        else:
+            logger.error(
+                "❌ Sem shares históricos para %s — cluster sem alocação AKS para %s",
+                cluster_name, date_str,
+            )
+        return
+
     ns_costs = {ns: cost for ns, cost in ns_costs.items() if cost > 0}
 
     if not ns_costs:
