@@ -132,7 +132,7 @@ def run(pipeline_date: Optional[str] = None) -> None:
         cached_compact = "; ".join(cached_clusters)
         logger.warning(
             "⚠ AKS_OPENCOST_CACHED: %d cluster(s) usando shares históricos (OpenCost indisponível)"
-            " | Clusters: %s | Ação: verificar pods OpenCost nesses clusters",
+            " | Ocorrências: %s | Ação: verificar pods OpenCost nesses clusters",
             len(cached_clusters), cached_compact,
         )
         has_alerts = True
