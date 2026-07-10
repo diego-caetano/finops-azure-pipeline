@@ -22,6 +22,12 @@ O pipeline processa **apenas** recursos das subscriptions KMM. O FOCUS Report co
 |---|---|---|
 | KMM PRD | Azure EA - KMM - PRD | `52d4423b-7ed9-4673-b8e2-fa21cdb83176` |
 | KMM DEV-TEST | Azure EA - KMM - DEV-TEST | `3f6d197f-f70b-4c2c-b981-8bb575d47a7a` |
+| PME Services PRD | nstech-pme-services-prd-sub | `7038ef68-75ba-48fd-955a-4e67b86bca45` |
+| PME Services DEV | nstech-pme-services-dev-sub | `66dc1f31-e830-409e-afe8-621c75ff92fc` |
+| PME Services HML | nstech-pme-services-hml-sub | `b9fa758a-0ccf-48a6-9033-7e92c14091e7` |
+| MG Services PRD | nstech-mg-services-prd-sub | `80d65916-3cc3-4fab-a902-c2832d851fdf` |
+| MG Services DEV | nstech-mg-services-dev-sub | `0d606793-89c9-44a2-a1f9-a30fc650a9cd` |
+| MG Services HML | nstech-mg-services-hml-sub | `640f2402-d9d1-4755-a8f6-8930cbb132e8` |
 
 **Atenção:** o FOCUS armazena `SubscriptionId` (via `SubAccountId`) no formato ARM completo `/subscriptions/{guid}`. O filtro em s01 normaliza esse valor antes de comparar com os GUIDs da constante.
 
@@ -266,7 +272,7 @@ manifest.csv:
 
 ---
 
-## Estado atual — tudo operacional ✅
+## Estado atual — tudo operacional ✅ (verificado 2026-07-06)
 
 ### Código Python — 100% implementado
 - [x] `finops/utils/dates.py`, `finops/utils/logging.py`, `finops/storage.py`
@@ -279,7 +285,7 @@ manifest.csv:
 - [x] `finops/steps/s03d_backup.py` — snapshot→alias; vault→ARM backupProtectedItems; fallback WEIGHT_PROPORTIONAL; gera audit CSVs
 - [x] `finops/steps/s04_client_weights.py`
 - [x] `finops/steps/s05_consolidate.py` — `_read_csv_partition` com include/exclude; colapsa AKS por (Date,ServiceKey,Cliente); filtra DEFAULT histórico
-- [x] `finops/steps/s06_fact_allocated_cost.py` — agrega fact_cost por ResourceId ANTES do join (meter fan-out guard); 5 outputs
+- [x] `finops/steps/s06_fact_allocated_cost.py` — agrega fact_cost por ResourceId ANTES do join; 5 outputs
 - [x] `finops/steps/s07_consolidate_pbi.py` — append idempotente; TotalCost via reconciliation; schema alignment
 - [x] `finops/steps/s08_quality_check.py` — 3 checks: (1) NAMESPACE_SEM_ALIAS com lista compacta numa linha (campo `Ocorrências:` no e-mail), (2) RECURSO_NAO_ALOCADO, (3) AKS_OPENCOST_CACHED
 - [x] `jobs/run_pipeline.py`, `jobs/run_aks.py`, `jobs/run_sync_rg_tags.py`
@@ -292,9 +298,10 @@ manifest.csv:
 - [x] `k8s/job-fix-consolidated.yaml`, `k8s/job-retro.yaml`
 
 ### Infraestrutura
-- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — build cq1h (2026-06-19)
+- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — último build verificado: cq1h (2026-06-19); rebuildar após novos commits
 - [x] 5 clusters AKS com OpenCost e CronJobs aplicados
 - [x] Consolidado maio: `fact_allocated_cost_2026-05.parquet` (905.865 linhas, 31 datas) ✅
+- [x] Consolidado junho: pipeline em produção desde 01/06; mês fechou em 2026-07-03 (D+3 do dia 30/06)
 
 ---
 
@@ -352,8 +359,6 @@ kubectl get configmap finops-aks-config -n finops -o jsonpath='{.data.OPENCOST_T
 5. `Share = WeightedUsage / total_tagged_weighted` | `AllocationMethod=SQLPOOL_CPU`
 6. Fallback: CPU=0 recebe peso mínimo `0.01`
 
-**Adicionar novo vault:** editar `config/reference/backup_vaults.csv` — sem alterar código.
-
 ---
 
 ## s03d — lógica de alocação Azure Backup e Snapshots
@@ -370,6 +375,8 @@ kubectl get configmap finops-aks-config -n finops -o jsonpath='{.data.OPENCOST_T
 3. Resolve cliente por item: `friendlyName → alias` ou `sourceResourceId.RG → rg_tags`
 4. Itens COMPARTILHADO redistribuídos proporcionalmente aos mapeados
 5. `AllocationMethod=BACKUP_VAULT_ITEMS` | fallback WEIGHT_PROPORTIONAL se ARM falhar
+
+**Adicionar novo vault:** editar `config/reference/backup_vaults.csv` — sem alterar código.
 
 ---
 

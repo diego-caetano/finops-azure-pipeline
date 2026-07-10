@@ -54,8 +54,11 @@ _COMPARTILHADO = "COMPARTILHADO"
 TARGET_SUBSCRIPTIONS = [
     s.strip()
     for s in os.environ.get(
-        "SUBSCRIPTION_IDS",
-        "52d4423b-7ed9-4673-b8e2-fa21cdb83176,3f6d197f-f70b-4c2c-b981-8bb575d47a7a"
+        "BILLING_SUBSCRIPTION_IDS",
+        "52d4423b-7ed9-4673-b8e2-fa21cdb83176,3f6d197f-f70b-4c2c-b981-8bb575d47a7a,"
+        "7038ef68-75ba-48fd-955a-4e67b86bca45,66dc1f31-e830-409e-afe8-621c75ff92fc,"
+        "b9fa758a-0ccf-48a6-9033-7e92c14091e7,80d65916-3cc3-4fab-a902-c2832d851fdf,"
+        "0d606793-89c9-44a2-a1f9-a30fc650a9cd,640f2402-d9d1-4755-a8f6-8930cbb132e8"
     ).split(",")
     if s.strip()
 ]
