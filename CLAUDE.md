@@ -151,6 +151,7 @@ Override pós-hierarquia:
 05:00 UTC           → s03b_aks           (dentro de cada cluster compartilhado)
 06:00 UTC           → pipeline principal (s01→s02→s03a→s03c→s03d→s04→s05→s06→s07→s08) — D-3 BRT
 07:00 UTC (2ª-feira)→ finops-retro-fix   (reprocessa últimos 7 dias com FOCUS atualizado)
+09:00 UTC (2ª-feira)→ finops-suggestions (s09 — sugestões de redução de custo, após retro-fix)
 ```
 
 | Step | Arquivo | Descrição |
@@ -167,6 +168,7 @@ Override pós-hierarquia:
 | s06 | `finops/steps/s06_fact_allocated_cost.py` | AllocatedCost = BilledCost × Share; agrega fact_cost por ResourceId ANTES do join |
 | s07 | `finops/steps/s07_consolidate_pbi.py` | Append diário idempotente + manifest.csv |
 | s08 | `finops/steps/s08_quality_check.py` | Alertas de qualidade: (1) namespaces sem alias, (2) recursos não alocados, (3) clusters AKS usando shares cacheados (`AKS_OPENCOST_CACHED`) |
+| s09 | `finops/steps/s09_cost_suggestions.py` | Sugestões semanais de redução de custos: (1) PESO_PROPORCIONAL — recursos sem dono com custo expressivo, (2) RECURSO_SEM_DONO — recursos não alocados; saída em `gold/cost_suggestions/` |
 
 **FOCUS_LAG_DAYS = 3** (em `finops/utils/dates.py`): pipeline processa D-3; retro_fix semanal cobre lags maiores.
 
@@ -216,6 +218,8 @@ PBI_CONSOLIDATED_PREFIX=gold/fact_allocated_cost_consolidated
 PBI_MANIFEST_BLOB=gold/fact_allocated_cost_consolidated/manifest.csv
 BACKUP_OUT_PREFIX=gold/backup_allocation_share
 QUALITY_ALERTS_PREFIX=gold/quality_alerts
+SUGGESTIONS_PREFIX=gold/cost_suggestions
+MIN_SUGGESTION_COST=20.0   # limiar mínimo em R$ para incluir recurso nas sugestões
 
 # OpenCost (usado apenas no job AKS)
 OPENCOST_ENDPOINT=http://opencost.opencost.svc:9003
@@ -396,9 +400,10 @@ Identity `id-mg-kmm-finops-aks-prd-newkmm-eus-prd` (CLIENT_ID: `40995235-e00b-41
 ## Comandos úteis
 
 ```bash
-# Build da imagem
-$env:PYTHONIOENCODING="utf-8"
-az acr build --registry registrykmm --image finops-pipeline:latest .
+# Build da imagem (PYTHONIOENCODING evita crash de encoding no Windows ao fazer streaming dos logs)
+# PowerShell: $env:PYTHONIOENCODING="utf-8"; az acr build --registry registrykmm --image finops-pipeline:latest .
+# Bash/Claude:
+PYTHONIOENCODING=utf-8 az acr build --registry registrykmm --image finops-pipeline:latest .
 
 # Conectar no cluster e aplicar manifests
 az aks get-credentials --resource-group <RG> --name <CLUSTER>
