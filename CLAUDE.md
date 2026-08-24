@@ -33,6 +33,61 @@ O pipeline processa **apenas** recursos das subscriptions KMM. O FOCUS Report co
 
 ---
 
+## ✅ INCIDENTE RESOLVIDO — migração EA→MCA quebrou a fonte do FOCUS Export (2026-08-01 a 2026-08-24)
+
+Por volta de 2026-07-13/14 as subscriptions KMM/MG foram migradas do enrollment EA antigo
+(billing account `52548376`, "Tecchapeco Sistemas LTDA") para uma nova conta **Microsoft
+Customer Agreement (MCA)** chamada **"KMM Soluções Tecnológicas LTDA"**
+(`cacde175-cc1c-5e70-0298-82465b2a4f47:0dbac1ab-1851-4dc1-973c-9293db9d06f5_2019-05-31`).
+
+O export que o pipeline lê (`azure-cost-export-focus10-52548376`, no storage
+`azurecostexportfocus10`/container `azurecostexportfocus10`) continua **ativo** mas órfão:
+desde 01/08 só recebe registros residuais de Reservation de empresas não-relacionadas
+(TRAFEGUS, ATUA, MULTISOFTWARE, OPENTECH). `fact_cost` está com **0 linhas todo agosto/2026**
+como consequência — confirmado rodando `sh/retro_fix.py` para 06/08→16/08 (11/11 datas OK,
+mas todas com 0 linhas). Validado via Cost Management Query API (bypassando o export) que o
+custo real de KMM PRD nesse período é normal (R$5,8k–16k/dia) — ou seja, o dado existe, só não
+chega mais nesse export.
+
+**Já existe uma exportação nova e correta**, criada pela própria migração:
+```
+Export         : MCA-KMM-focus-cost
+Billing account: KMM Soluções Tecnológicas LTDA (cacde175-...:0dbac1ab-...)
+Account        : azurecostexportfocus10 (mesmo storage)
+Container      : mca
+Prefixo        : KMM/MCA-KMM-focus-cost
+Ativo desde    : 2026-07-14
+```
+Cobertura confirmada via inspeção do parquet (01–17/08): KMM PRD (36.316 linhas, R$120k),
+KMM DEV-TEST (8.854 linhas, R$21,8k), MG PRD (7.280 linhas, R$30k), MG HML (5.530 linhas, R$5,7k).
+**PME Services (PRD/DEV/HML) e MG DEV não aparecem** — confirmado via Cost Management Query API
+que o custo real dessas 4 subscriptions é zero no período (não é problema de permissão), mas a
+billing account de origem delas não foi identificada — se voltarem a ter custo, procurar entre as
+outras contas MCA do tenant (DATAMEX, "KMM ... Filial Atua", BTRANS, NS KOTE, Niche Supply Tech).
+
+**Fix aplicado em 2026-08-24:**
+```diff
+- FOCUS_CONTAINER: "azurecostexportfocus10"
+- FOCUS_PREFIX: "costexport/azure-cost-export-focus10-52548376"
++ FOCUS_CONTAINER: "mca"
++ FOCUS_PREFIX: "KMM/MCA-KMM-focus-cost"
+```
+Trocado em `k8s/cronjob-pipeline.yaml` (ConfigMap `finops-pipeline-config`), `k8s/cronjob-aks.yaml`
+(ConfigMap `finops-aks-config`), `.env`, `.env.example` e `docs/TECNICO.md`. `kubectl apply`
+feito nos 2 CronJobs nos 5 clusters AKS (com restauração manual do `CLUSTER_NAME` e do override
+`OPENCOST_TIMEOUT_SEC=180` de aks-hml-newkmm, que o apply sobrescreveria com os defaults do YAML).
+
+`sh/retro_fix.py --start 2026-08-01 --end 2026-08-23` rodado via `k8s/job-retro.yaml` no cluster
+central (aks-prd-newkmm) — as 23 datas retornaram `Status=OK` com custo real (R$10,4k–11,2k/dia,
+dentro da faixa esperada), consolidado PBI de agosto reconstruído automaticamente ao final do job
+(rebuild em lote único): **R$244.174,67 total**, manifest.csv atualizado.
+
+**Ainda em aberto:** billing account MCA de origem de PME Services e MG DEV não identificada
+(custo real = zero no período, sem urgência); decisão sobre desativar o export EA antigo
+(`azure-cost-export-focus10-52548376`) ainda pendente.
+
+---
+
 ## Três Storage Accounts — papéis distintos
 
 ### 1. Storage de ENTRADA — FOCUS Report (somente leitura)
@@ -44,6 +99,10 @@ Prefixo     : costexport/azure-cost-export-focus10-52548376/
 Estrutura   : costexport/azure-cost-export-focus10-52548376/<yyyyMMdd-yyyyMMdd>/<arquivo>
 ```
 Permissão necessária: `Storage Blob Data Reader`
+
+⚠️ Este export ficou órfão após a migração EA→MCA de jul/2026 (ver incidente resolvido no topo
+do arquivo). Desde 2026-08-24 o pipeline lê de `mca/KMM/MCA-KMM-focus-cost` — os valores acima
+(`azurecostexportfocus10`/`costexport/...`) não são mais a fonte usada pelo ConfigMap.
 
 ### 2. Storage de SAÍDA — Pipeline Python (leitura e escrita)
 ```
@@ -276,11 +335,11 @@ manifest.csv:
 
 ---
 
-## Estado atual — tudo operacional ✅ (verificado 2026-07-06)
+## Estado atual (verificado 2026-08-24 — incidente FOCUS Export resolvido, ver topo do arquivo)
 
 ### Código Python — 100% implementado
 - [x] `finops/utils/dates.py`, `finops/utils/logging.py`, `finops/storage.py`
-- [x] `finops/steps/s00_sync_rg_tags.py`
+- [x] `finops/steps/s00_sync_rg_tags.py` — fix 2026-08-17: `azure-mgmt-resource` 26.0.0 (latest) parou de reexportar `ResourceManagementClient` no `__init__`; import corrigido para `azure.mgmt.resource.resources` e versão pinada em `requirements.txt` (`==26.0.0`)
 - [x] `finops/steps/s01_ingest_focus.py` — `EffectiveCost` (não BilledCost); filtra `EffectiveCost>0`; normaliza ARM prefix
 - [x] `finops/steps/s02_classify.py` — 6 regras, MC_ pattern, elastic pools/vaults/snapshots override
 - [x] `finops/steps/s03a_dedicated.py`
@@ -295,21 +354,29 @@ manifest.csv:
 - [x] `jobs/run_pipeline.py`, `jobs/run_aks.py`, `jobs/run_sync_rg_tags.py`
 - [x] `sh/retro_fix.py` — aceita `--start`/`--end` ou `RETRO_START`/`RETRO_END`; consolidação PBI em lote único ao final
 - [x] `sh/build_consolidated.py`
+- [x] `finops/steps/s09_cost_suggestions.py` — deployado, cronjob `finops-suggestions` rodando semanalmente
 
 ### Kubernetes
 - [x] `k8s/cronjob-pipeline.yaml`, `k8s/cronjob-aks.yaml`, `k8s/cronjob-sync-rg-tags.yaml`
 - [x] `k8s/cronjob-retro-fix.yaml` — toda 2ª-feira 07:00 UTC
+- [x] `k8s/cronjob-suggestions.yaml` — s09, toda 2ª-feira 09:00 UTC
 - [x] `k8s/job-fix-consolidated.yaml`, `k8s/job-retro.yaml`
 
 ### Infraestrutura
-- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — último build verificado: cq1h (2026-06-19); rebuildar após novos commits
+- [x] ACR: `registrykmm.azurecr.io/finops-pipeline:latest` — rebuild cq1q em 2026-08-17 (fix ResourceManagementClient); registry fica na subscription KMM PRD (`52d4423b`), RG `KMM-Registry` — `az account set` para essa sub antes de `az acr build`
 - [x] 5 clusters AKS com OpenCost e CronJobs aplicados
 - [x] Consolidado maio: `fact_allocated_cost_2026-05.parquet` (905.865 linhas, 31 datas) ✅
 - [x] Consolidado junho: pipeline em produção desde 01/06; mês fechou em 2026-07-03 (D+3 do dia 30/06)
+- [x] Consolidado agosto: recuperado em 2026-08-24 (retro-fix 01–23/08, R$244.174,67) — ver incidente resolvido no topo do arquivo. Dias 24/08 em diante seguem cobertos pelo pipeline diário normal (D-3)
 
 ---
 
 ## Pendências abertas
+
+### FOCUS Export
+- [ ] Descobrir em qual billing account MCA ficaram PME Services e MG DEV (hoje custo real = zero, mas sem fonte identificada para quando voltar a ter uso)
+- [ ] Decidir o que fazer com o export EA antigo (`azure-cost-export-focus10-52548376`) — deixar ou desativar
+- [ ] Investigar por que `manifest.csv` mostra 27–31/07 com 0 linhas (retro-fix de 2026-08-03, fonte antiga) — fora do escopo do fix de agosto, não verificado ainda
 
 ### Clusters sem OpenCost (bloquear — instalar OpenCost primeiro)
 - [ ] aks-mg-kmm-dados-eus-prd
@@ -400,10 +467,14 @@ Identity `id-mg-kmm-finops-aks-prd-newkmm-eus-prd` (CLIENT_ID: `40995235-e00b-41
 ## Comandos úteis
 
 ```bash
-# Build da imagem (PYTHONIOENCODING evita crash de encoding no Windows ao fazer streaming dos logs)
-# PowerShell: $env:PYTHONIOENCODING="utf-8"; az acr build --registry registrykmm --image finops-pipeline:latest .
-# Bash/Claude:
-PYTHONIOENCODING=utf-8 az acr build --registry registrykmm --image finops-pipeline:latest .
+# Build da imagem — ACR fica na subscription KMM PRD, não na sub "corrente" por padrão:
+az account set --subscription 52d4423b-7ed9-4673-b8e2-fa21cdb83176
+
+# PYTHONIOENCODING=utf-8 NÃO resolve o crash de encoding do streaming de log no Windows
+# (colorama quebra em unicode independente da env var). Usar --no-wait + polling:
+az acr build --registry registrykmm --image finops-pipeline:latest . --no-wait
+# anota o "Queued a build with ID: cqXX" e faz polling:
+az acr task show-run --registry registrykmm --run-id cqXX --query "{status:status}" -o tsv
 
 # Conectar no cluster e aplicar manifests
 az aks get-credentials --resource-group <RG> --name <CLUSTER>

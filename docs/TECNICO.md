@@ -107,8 +107,8 @@ finops-v2/
 # Storage de entrada (FOCUS Report — somente leitura)
 FOCUS_STORAGE_ACCOUNT=azurecostexportfocus10
 FOCUS_SUBSCRIPTION_ID=0535039d-8b8e-4ac1-9fce-9f727e8ba2b1
-FOCUS_CONTAINER=azurecostexportfocus10
-FOCUS_PREFIX=costexport/azure-cost-export-focus10-52548376
+FOCUS_CONTAINER=mca
+FOCUS_PREFIX=KMM/MCA-KMM-focus-cost
 
 # Subscriptions incluídas no pipeline
 BILLING_SUBSCRIPTION_IDS=52d4423b-7ed9-4673-b8e2-fa21cdb83176,3f6d197f-f70b-4c2c-b981-8bb575d47a7a

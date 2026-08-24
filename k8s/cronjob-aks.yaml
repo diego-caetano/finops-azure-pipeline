@@ -24,8 +24,8 @@ metadata:
   namespace: finops
 data:
   FOCUS_STORAGE_ACCOUNT: "azurecostexportfocus10"
-  FOCUS_CONTAINER: "azurecostexportfocus10"
-  FOCUS_PREFIX: "costexport/azure-cost-export-focus10-52548376"
+  FOCUS_CONTAINER: "mca"
+  FOCUS_PREFIX: "KMM/MCA-KMM-focus-cost"
   PIPELINE_STORAGE_ACCOUNT: "stpslkmmfinopseusprd"
   PIPELINE_CONTAINER: "finops-v2"
   REFERENCE_PREFIX: "config/reference"
