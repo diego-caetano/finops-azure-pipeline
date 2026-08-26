@@ -80,7 +80,17 @@ feito nos 2 CronJobs nos 5 clusters AKS (com restauração manual do `CLUSTER_NA
 `sh/retro_fix.py --start 2026-08-01 --end 2026-08-23` rodado via `k8s/job-retro.yaml` no cluster
 central (aks-prd-newkmm) — as 23 datas retornaram `Status=OK` com custo real (R$10,4k–11,2k/dia,
 dentro da faixa esperada), consolidado PBI de agosto reconstruído automaticamente ao final do job
-(rebuild em lote único): **R$244.174,67 total**, manifest.csv atualizado.
+(rebuild em lote único).
+
+**Validação vs fonte (2026-08-25):** comparação linha a linha entre o parquet FOCUS bruto (`mca`)
+e o `AllocatedCost` consolidado do pipeline, aplicando os mesmos filtros do s01 (8 subscriptions
+KMM, `EffectiveCost>0`). 01–22/08 bateram com diferença de centavos (arredondamento). **23/08
+divergiu 57%** (FOCUS R$10.933,47 vs pipeline R$4.694,99) — causa: a retrocarga rodou em 24/08
+pedindo até `--end 2026-08-23`, ou seja D-1, antes do billing lag da Microsoft fechar aquele dia
+(por isso o pipeline usa D-3 por padrão). Reprocessado isoladamente em 2026-08-26
+(`RETRO_START=RETRO_END=2026-08-23`, já com folga suficiente) — bateu exato com o FOCUS
+(R$10.933,47). **Total de agosto validado: R$250.413,00** (01–23/08). 22/08 em diante já é
+coberto pelo pipeline diário normal (D-3), sem intervenção manual.
 
 **Ainda em aberto:** billing account MCA de origem de PME Services e MG DEV não identificada
 (custo real = zero no período, sem urgência); decisão sobre desativar o export EA antigo
@@ -367,7 +377,7 @@ manifest.csv:
 - [x] 5 clusters AKS com OpenCost e CronJobs aplicados
 - [x] Consolidado maio: `fact_allocated_cost_2026-05.parquet` (905.865 linhas, 31 datas) ✅
 - [x] Consolidado junho: pipeline em produção desde 01/06; mês fechou em 2026-07-03 (D+3 do dia 30/06)
-- [x] Consolidado agosto: recuperado em 2026-08-24 (retro-fix 01–23/08, R$244.174,67) — ver incidente resolvido no topo do arquivo. Dias 24/08 em diante seguem cobertos pelo pipeline diário normal (D-3)
+- [x] Consolidado agosto: recuperado em 2026-08-24 (retro-fix 01–23/08) e validado contra o FOCUS bruto em 2026-08-26 (**R$250.413,00**, 01–23/08 batendo exato) — ver incidente resolvido no topo do arquivo. Dias seguintes cobertos pelo pipeline diário normal (D-3)
 
 ---
 
