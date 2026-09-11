@@ -191,6 +191,40 @@ DIVIDE(
 )
 ```
 
+### Medidas — AKS + Banco de Dados
+
+```dax
+// Custo AKS — apenas clusters compartilhados rateados via OpenCost
+Custo AKS =
+CALCULATE(
+    [Total Alocado],
+    FactAllocatedCost[AllocationMethod] IN {"AKS_OPENCOST", "AKS_OPENCOST_CACHED"}
+)
+
+// Custo Banco de Dados — SQL Elastic Pool, SQL Database, PostgreSQL flexível
+// (inclui dedicados via tag e compartilhados via rateio CPU+Disco)
+Custo Banco de Dados =
+CALCULATE(
+    [Total Alocado],
+    FactAllocatedCost[ResourceType] IN {
+        "SQL elastic pool",
+        "SQL database",
+        "Azure Database for PostgreSQL flexible server",
+        "Microsoft.Sql/servers/restorableDroppedDatabases"
+    }
+)
+
+// Soma das duas categorias
+Custo AKS + Banco de Dados =
+[Custo AKS] + [Custo Banco de Dados]
+
+// % que AKS+BD representa do custo total do cliente — respeita o filtro de Cliente ativo
+% AKS + BD do Cliente =
+DIVIDE([Custo AKS + Banco de Dados], [Total Alocado])
+```
+
+> ⚠️ `ResourceType` reflete o recurso de billing real (o pool, a VM do node, etc.), não uma categoria lógica — por isso o filtro de banco de dados é por `ResourceType`, e o de AKS por `AllocationMethod` (o `ResourceType` de um recurso AKS_OPENCOST é o node/VM do cluster, não "AKS").
+
 ### Medidas de variação
 
 ```dax
@@ -290,6 +324,29 @@ SUM(Manifest[Rows])
 **Formatação condicional na tabela — coluna Status:**
 - `OK` → fundo `#E1F5EE`, texto `#0F6E56` (verde)
 - `ERROR` → fundo `#FAECE7`, texto `#993C1D` (vermelho)
+
+---
+
+### Página 4 — AKS + Banco de Dados por Cliente
+
+**Objetivo:** visibilidade dedicada do custo de workloads de infraestrutura compartilhada (AKS) e de dados (SQL/PostgreSQL) por cliente — os dois grupos de recursos com maior potencial de rateio "invisível" para quem só olha o total.
+
+| Visual | Tipo | Campos | Justificativa |
+|---|---|---|---|
+| Custo AKS | Cartão | `Custo AKS` | Total rateado dos clusters AKS compartilhados no período |
+| Custo Banco de Dados | Cartão | `Custo Banco de Dados` | Total de SQL Elastic Pool + SQL Database + PostgreSQL |
+| AKS + Banco de Dados | Cartão | `Custo AKS + Banco de Dados` | Soma das duas categorias — quanto do custo total isso representa |
+| Clientes com custo AKS/BD | Cartão | `DISTINCTCOUNT(Cliente)` filtrado pelas duas categorias | Quantos clientes têm consumo nessas categorias |
+| Evolução diária | Área empilhada | Eixo: `Date` \| Séries: `Custo AKS`, `Custo Banco de Dados` | Tendência e anomalias de consumo de infra/dados ao longo do tempo |
+| Banco de dados por engine | Barras horizontais | Eixo: `ResourceType` (filtrado à lista de DB) \| Valor: `Total Alocado` | Onde o custo de banco está concentrado (pool vs standalone vs PostgreSQL) |
+| AKS por cluster | Barras horizontais | Eixo: `ServiceKey` \| Valor: `Custo AKS` | Qual cluster compartilhado pesa mais no rateio |
+| Ranking de clientes | Tabela | `Cliente`, `Custo AKS`, `Custo Banco de Dados`, `Custo AKS + Banco de Dados`, `% AKS + BD do Cliente` | Chargeback e priorização — quem depende mais de infra/dados compartilhados |
+| Filtro de cliente | Segmentador | `Cliente` | Isola a visão de um cliente |
+| Filtro de data | Segmentador | `Date` | Período de análise |
+
+**Cores sugeridas:** `Custo AKS` → `#F4400A` (laranja nstech) · `Custo Banco de Dados` → `#0D0F2B` ou um azul de apoio (ex.: `#2A78D6`) para manter contraste com o laranja na área empilhada e nas barras.
+
+> Nota de leitura: apenas clusters AKS **compartilhados** (que passam pelo rateio OpenCost em s03b) aparecem em `Custo AKS` — um cluster totalmente dedicado a um cliente já entra como `DEDICATED_TAG`/`TAG_RG_INHERITED` e soma no total geral do cliente, não nesta métrica.
 
 ---
 
@@ -417,6 +474,31 @@ SELECT
     END AS FlagQualidade
 FROM fact_allocated_cost f
 ```
+
+---
+
+### View: vw_custo_aks_banco_cliente
+
+**Objetivo:** base para o dashboard de AKS + Banco de Dados — mesma lógica das medidas `Custo AKS` / `Custo Banco de Dados` do Power BI.
+
+```sql
+SELECT
+    Date,
+    Cliente,
+    SUM(CASE WHEN AllocationMethod IN ('AKS_OPENCOST', 'AKS_OPENCOST_CACHED')
+             THEN AllocatedCost ELSE 0 END)                       AS CustoAKS,
+    SUM(CASE WHEN ResourceType IN (
+             'SQL elastic pool', 'SQL database',
+             'Azure Database for PostgreSQL flexible server',
+             'Microsoft.Sql/servers/restorableDroppedDatabases')
+             THEN AllocatedCost ELSE 0 END)                       AS CustoBancoDeDados,
+    SUM(AllocatedCost)                                             AS TotalAlocadoCliente
+FROM fact_allocated_cost
+GROUP BY Date, Cliente
+ORDER BY Date, CustoAKS + CustoBancoDeDados DESC
+```
+
+> `CustoAKS` só existe para clusters compartilhados (rateio OpenCost) — um cluster dedicado aparece via `DEDICATED_TAG`/`TAG_RG_INHERITED` e soma em `TotalAlocadoCliente`, não em `CustoAKS`.
 
 ---
 
