@@ -220,10 +220,10 @@ Override pós-hierarquia:
 | aks-hml-newkmm | RG-US-PRD-KMM | ✅ http://10.152.12.117:9003 — OPENCOST_TIMEOUT_SEC=180 (ConfigMap local; cluster spot tem muitos nós) |
 | aks-mg-kmm-firewall-eus-prd | RG-US-PRD-KMM | ✅ http://10.152.51.4:9003 |
 | aks-mg-kmm-firewall-eus-hml | RG-DEV-KMM (sub: 3f6d197f — usar `--subscription 3f6d197f-f70b-4c2c-b981-8bb575d47a7a`) | ✅ http://10.153.6.6:9003 |
-| aks-mg-kmm-dados-eus-prd | (confirmar) | ❌ pendente instalação |
-| aks-prd-emissor | (confirmar) | ❌ pendente migração |
-| aks-mg-kmm-win-eus-hml | (confirmar) | ❌ pendente instalação |
+| aks-mg-kmm-dados-eus-prd | rg-mg-kmm-dados-eus-prd (sub: 52d4423b) | ❌ pendente instalação |
 | aks-mg-kmm-nocst-eus-*-01 | (confirmar) | ❌ dedicated NORCOAST — não necessário |
+
+> `aks-prd-emissor` e `aks-mg-kmm-win-eus-hml` foram removidos do tenant (confirmado via Resource Graph em 2026-09-11) — não existem mais como clusters a migrar/instalar OpenCost.
 
 ---
 
@@ -403,8 +403,6 @@ manifest.csv:
 
 ### Clusters sem OpenCost (bloquear — instalar OpenCost primeiro)
 - [ ] aks-mg-kmm-dados-eus-prd
-- [ ] aks-prd-emissor
-- [ ] aks-mg-kmm-win-eus-hml
 
 ### Power BI
 - [ ] Reconectar `.pbix` via folder connector para `fact_allocated_cost_YYYY-MM.parquet` — ver `docs/POWER_BI.md`
