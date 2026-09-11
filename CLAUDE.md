@@ -96,6 +96,20 @@ coberto pelo pipeline diário normal (D-3), sem intervenção manual.
 (custo real = zero no período, sem urgência); decisão sobre desativar o export EA antigo
 (`azure-cost-export-focus10-52548376`) ainda pendente.
 
+**Gap de julho (21–31/07) — descoberto e corrigido em 2026-08-27:** o `manifest.csv` tinha uma
+nota antiga dizendo que só 27–31/07 estavam com 0 linhas; ao inspecionar o manifest diretamente
+no blob, o gap real era **21–31/07** (11 dias) — o export EA antigo aparentemente parou de
+entregar dado bom para KMM/MG por volta de 21/07 (quase uma semana depois da migração de
+billing account em 13-14/07), não só em agosto como o incidente original registrava. O
+consolidado de julho (`fact_allocated_cost_2026-07.parquet`) tinha sido gerado pela última vez
+em 2026-08-03 — antes da troca de fonte EA→MCA (24/08) — então nunca tinha sido reprocessado
+com a fonte nova. Rodado `sh/retro_fix.py --start 2026-07-21 --end 2026-07-31` (via
+`k8s/job-retro.yaml` no cluster central) em 2026-08-27: 11/11 datas OK, R$117.049,51 recuperados
+(~R$10,4k–10,8k/dia, consistente com a faixa validada de agosto). Consolidado mensal de julho
+reconstruído automaticamente ao final do job. **Não validado ainda linha a linha contra o FOCUS
+bruto** (como foi feito para agosto em 26/08) — recomenda-se essa validação antes de considerar
+julho definitivamente fechado.
+
 ---
 
 ## Três Storage Accounts — papéis distintos
@@ -386,7 +400,6 @@ manifest.csv:
 ### FOCUS Export
 - [ ] Descobrir em qual billing account MCA ficaram PME Services e MG DEV (hoje custo real = zero, mas sem fonte identificada para quando voltar a ter uso)
 - [ ] Decidir o que fazer com o export EA antigo (`azure-cost-export-focus10-52548376`) — deixar ou desativar
-- [ ] Investigar por que `manifest.csv` mostra 27–31/07 com 0 linhas (retro-fix de 2026-08-03, fonte antiga) — fora do escopo do fix de agosto, não verificado ainda
 
 ### Clusters sem OpenCost (bloquear — instalar OpenCost primeiro)
 - [ ] aks-mg-kmm-dados-eus-prd
