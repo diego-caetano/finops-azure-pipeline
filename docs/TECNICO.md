@@ -41,13 +41,14 @@
 > **Migração KMM→MG (2026-09-14):** os recursos das subscriptions KMM estão sendo migrados para as
 > subscriptions MG Services; as duas pontas coexistem até a migração terminar. `aks-mg-nst-core-eus-prd`
 > e `aks-mg-nst-core-eus-hml` já têm carga real de cliente (namespaces ativos há semanas/meses) mas
-> **não estão em `cluster_config.csv`/`opencost_clusters.csv`, não têm CronJob nem Managed Identity**.
-> Além de faltar instalar o OpenCost, o Resource Group de cada cluster (e o `MC_...` de nós, gerado
-> automaticamente) está tagueado `FINOPS-CLIENTE=COMPARTILHADO` — isso faz a regra `TAG_RG_SHARED`
-> (rateio por peso financeiro) disparar antes da regra `OVERRIDE_RG_AUTO` (que alimentaria o rateio
-> real por namespace via OpenCost), então **instalar o OpenCost sozinho não resolve** — a tag do RG
-> também precisa mudar. Runbook completo: `docs/MANUTENCAO.md#adicionar-um-novo-cluster-aks-compartilhado`.
-> Detalhe completo da investigação: `CLAUDE.md` → Pendências abertas → "Migração KMM → MG Services".
+> não tinham CronJob nem Managed Identity, e não estavam em `cluster_config.csv`/`opencost_clusters.csv`
+> — os dois RGs (e o `MC_...` de nós, gerado automaticamente) estão tagueados
+> `FINOPS-CLIENTE=COMPARTILHADO`, mas isso **não é um bloqueio**: `s02_classify.py` já ignora essa tag
+> de propósito para RGs `MC_*` que batem com um cluster cadastrado em `cluster_config.csv` (variável
+> `rule4_wins`), gerando `ServiceKey=AKS:<cluster>` normalmente. `cluster_config.csv` já foi atualizado
+> com as duas linhas — falta só instalar o OpenCost e aplicar CronJob/Managed Identity. Runbook
+> completo: `docs/MANUTENCAO.md#adicionar-um-novo-cluster-aks-compartilhado`. Detalhe completo da
+> investigação: `CLAUDE.md` → Pendências abertas → "Migração KMM → MG Services".
 
 ---
 

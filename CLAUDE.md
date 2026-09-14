@@ -432,19 +432,16 @@ decisão de quando/se os clusters KMM (`aks-prd-newkmm`, `aks-hml-newkmm` etc.) 
 - [ ] **OpenCost NÃO está instalado em nenhum dos dois** (confirmado: sem namespace `opencost`, sem
   pods/serviços com esse label) — pré-requisito obrigatório antes de qualquer outra coisa, ver
   runbook em `docs/MANUTENCAO.md#adicionar-um-novo-cluster-aks-compartilhado`.
-- [ ] **Bloqueio adicional, não é só falta de OpenCost:** o Resource Group `rg-mg-nst-core-eus-prd`
-  (e `-hml`) **e** o RG de nós auto-gerado (`MC_rg-mg-nst-core-eus-*_aks-mg-nst-core-eus-*_eastus`)
-  já estão tagueados `FINOPS-CLIENTE=COMPARTILHADO` diretamente. Isso faz a **regra 3** da hierarquia
-  de classificação (`TAG_RG_SHARED` → rateio por peso financeiro, `s02_classify.py`) disparar *antes*
-  da **regra 4** (`OVERRIDE_RG_AUTO`, padrão `MC_<rg>_<cluster>_<region>` → `ServiceKey=AKS:<cluster>`,
-  a que alimenta o rateio real por namespace via OpenCost em `s03b`) — confirmado lendo
-  `resource_to_service` de 13/09: 740 dos 761 recursos desses clusters (VMSS, discos, VMs) caem em
-  `TAG_RG_SHARED`/`COMPARTILHADO`. **Instalar OpenCost e cadastrar em `cluster_config.csv` sozinho
-  não muda esse comportamento** — é preciso também remover/alterar a tag `FINOPS-CLIENTE` desses dois
-  Resource Groups (pai e `MC_...`) para que a regra 4 tenha chance de disparar.
 - [x] `config/reference/cluster_config.csv` já tem as duas linhas adicionadas (`Tipo=shared`,
-  `OpenCostUrl` vazio) — não muda o comportamento atual sozinho (ver bloqueio acima), mas deixa o
-  cadastro pronto para quando a tag do RG for corrigida e o OpenCost instalado.
+  `OpenCostUrl` vazio, já no Blob desde 2026-09-14) — isso já é suficiente para o `s02_classify.py`
+  reconhecer o padrão `MC_rg-mg-nst-core-eus-*_aks-mg-nst-core-eus-*_eastus` e gerar
+  `ServiceKey=AKS:<cluster>` para os recursos de nó (VMSS/discos/VMs), **mesmo esses Resource Groups
+  estando tagueados `FINOPS-CLIENTE=COMPARTILHADO`** — o código já trata isso de propósito
+  (`s02_classify.py` linha ~189, `rule4_wins`, comentário "OVERRIDE_RG_AUTO tem prioridade sobre
+  TAG_RG_SHARED ... ignorar tag COMPARTILHADO do rg_tags.csv"). A tag COMPARTILHADO no RG **não
+  precisa mudar** — confirmado simulando `_mc_cluster_vec` com a lista de clusters atualizada. Só
+  falta instalar o OpenCost + CronJob/Managed Identity; depois disso o rateio real por namespace via
+  `aks_system_namespaces.csv`/`clientes_alias.csv` (mesmo mecanismo dos outros clusters) já funciona.
 
 ### Namespaces AKS não identificados (2026-09-14)
 Ao investigar clientes com `Custo AKS=R$0` apesar de rodarem em `aks-prd-newkmm`/`aks-hml-newkmm`,
