@@ -28,13 +28,26 @@
 | aks-mg-kmm-firewall-eus-prd | RG-US-PRD-KMM | shared | http://10.152.51.4:9003 | ✅ |
 | aks-mg-kmm-firewall-eus-hml | RG-DEV-KMM | shared | http://10.153.6.6:9003 | ✅ |
 | aks-mg-kmm-dados-eus-prd | — | shared | — | ❌ OpenCost pendente |
-| aks-prd-emissor | — | shared | — | ❌ OpenCost pendente |
-| aks-mg-kmm-win-eus-hml | — | shared | — | ❌ OpenCost pendente |
+| aks-mg-nst-core-eus-prd | rg-mg-nst-core-eus-prd (sub MG Services PRD, `80d65916`) | shared | — | ❌ OpenCost pendente — cluster novo (migração KMM→MG), ver bloqueio abaixo |
+| aks-mg-nst-core-eus-hml | rg-mg-nst-core-eus-hml (sub MG Services HML, `640f2402`) | shared | — | ❌ OpenCost pendente — cluster novo (migração KMM→MG), ver bloqueio abaixo |
 | aks-mg-kmm-nocst-eus-prd-01 | — | dedicated | NORCOAST | N/A — clusters dedicados entram como DEDICATED_TAG |
 | aks-mg-kmm-nocst-eus-hml-01 | — | dedicated | NORCOAST | N/A |
 | aks-mg-kmm-nocst-eus-qa-01 | — | dedicated | NORCOAST | N/A |
 
+> `aks-prd-emissor` e `aks-mg-kmm-win-eus-hml` foram removidos do tenant (confirmado via Resource Graph em 2026-09-11) — não existem mais.
+
 > **Cluster central:** `aks-prd-newkmm` é o único que roda o pipeline principal (`finops-pipeline`) e o sync de tags (`finops-sync-rg-tags`). Os demais clusters executam apenas o job de OpenCost (`finops-aks`).
+
+> **Migração KMM→MG (2026-09-14):** os recursos das subscriptions KMM estão sendo migrados para as
+> subscriptions MG Services; as duas pontas coexistem até a migração terminar. `aks-mg-nst-core-eus-prd`
+> e `aks-mg-nst-core-eus-hml` já têm carga real de cliente (namespaces ativos há semanas/meses) mas
+> **não estão em `cluster_config.csv`/`opencost_clusters.csv`, não têm CronJob nem Managed Identity**.
+> Além de faltar instalar o OpenCost, o Resource Group de cada cluster (e o `MC_...` de nós, gerado
+> automaticamente) está tagueado `FINOPS-CLIENTE=COMPARTILHADO` — isso faz a regra `TAG_RG_SHARED`
+> (rateio por peso financeiro) disparar antes da regra `OVERRIDE_RG_AUTO` (que alimentaria o rateio
+> real por namespace via OpenCost), então **instalar o OpenCost sozinho não resolve** — a tag do RG
+> também precisa mudar. Runbook completo: `docs/MANUTENCAO.md#adicionar-um-novo-cluster-aks-compartilhado`.
+> Detalhe completo da investigação: `CLAUDE.md` → Pendências abertas → "Migração KMM → MG Services".
 
 ---
 

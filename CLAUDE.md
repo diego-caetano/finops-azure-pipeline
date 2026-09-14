@@ -221,6 +221,8 @@ Override pós-hierarquia:
 | aks-mg-kmm-firewall-eus-prd | RG-US-PRD-KMM | ✅ http://10.152.51.4:9003 |
 | aks-mg-kmm-firewall-eus-hml | RG-DEV-KMM (sub: 3f6d197f — usar `--subscription 3f6d197f-f70b-4c2c-b981-8bb575d47a7a`) | ✅ http://10.153.6.6:9003 |
 | aks-mg-kmm-dados-eus-prd | rg-mg-kmm-dados-eus-prd (sub: 52d4423b) | ❌ pendente instalação |
+| aks-mg-nst-core-eus-prd | rg-mg-nst-core-eus-prd (sub: 80d65916 — MG Services PRD) | ❌ pendente instalação — ver nota de migração abaixo |
+| aks-mg-nst-core-eus-hml | rg-mg-nst-core-eus-hml (sub: 640f2402 — MG Services HML) | ❌ pendente instalação — ver nota de migração abaixo |
 | aks-mg-kmm-nocst-eus-*-01 | (confirmar) | ❌ dedicated NORCOAST — não necessário |
 
 > `aks-prd-emissor` e `aks-mg-kmm-win-eus-hml` foram removidos do tenant (confirmado via Resource Graph em 2026-09-11) — não existem mais como clusters a migrar/instalar OpenCost.
@@ -403,6 +405,46 @@ manifest.csv:
 
 ### Clusters sem OpenCost (bloquear — instalar OpenCost primeiro)
 - [ ] aks-mg-kmm-dados-eus-prd
+
+### Migração KMM → MG Services (em andamento — coexistência obrigatória)
+Todos os recursos das subscriptions KMM (`52d4423b` PRD, `3f6d197f` DEV-TEST) estão sendo migrados
+para as subscriptions MG Services (`80d65916` PRD, `640f2402` HML). As duas pontas devem continuar
+sendo processadas pelo pipeline até a migração terminar e a subscription KMM ser deletada — **não
+remover as subscriptions KMM de `BILLING_SUBSCRIPTION_IDS` sem confirmação explícita**. Não há
+decisão de quando/se os clusters KMM (`aks-prd-newkmm`, `aks-hml-newkmm` etc.) serão descomissionados
+— por ora os dois conjuntos de clusters coexistem sem substituição 1:1 definida.
+
+- [ ] **`aks-mg-nst-core-eus-prd`** (RG `rg-mg-nst-core-eus-prd`, sub MG Services PRD) e
+  **`aks-mg-nst-core-eus-hml`** (RG `rg-mg-nst-core-eus-hml`, sub MG Services HML) são clusters AKS
+  reais, não cadastrados em nenhum lugar do pipeline (fora de `cluster_config.csv`/
+  `opencost_clusters.csv`, sem CronJob, sem Managed Identity) — descobertos em 2026-09-14 ao investigar
+  por que `Custo AKS` aparecia zerado para MG Services PRD.
+- [ ] **Já têm carga real de cliente rodando** — confirmado via `az aks command invoke` (funciona
+  nesses clusters mesmo com API server privado, sem precisar de VPN/peering):
+  - `aks-mg-nst-core-eus-prd`: ~27 namespaces de cliente ativos (`framento`, `cootravale`,
+    `cordenonsi`, `transportes-natal`, `transportadora-bompreco-ltda`, `rodolog-...`, `ribeiro`,
+    `marechal`, `mercosul`, `lunardi`, `letrans`, `dumar`, `dispan`, `brotense`, `barbieri`, e outros
+    ainda não vistos em nenhum outro cluster: `alicon`, `ecargo-mercosul`, `mrs`)
+  - `aks-mg-nst-core-eus-hml`: ~60 namespaces, roster quase idêntico ao de `aks-hml-newkmm` —
+    provável destino direto da migração desse cluster
+  - ⚠ namespace `marechak` (14 dias, `aks-mg-nst-core-eus-hml`) parece typo de `marechal` — confirmar
+    com quem criou antes de decidir se precisa de alias próprio
+- [ ] **OpenCost NÃO está instalado em nenhum dos dois** (confirmado: sem namespace `opencost`, sem
+  pods/serviços com esse label) — pré-requisito obrigatório antes de qualquer outra coisa, ver
+  runbook em `docs/MANUTENCAO.md#adicionar-um-novo-cluster-aks-compartilhado`.
+- [ ] **Bloqueio adicional, não é só falta de OpenCost:** o Resource Group `rg-mg-nst-core-eus-prd`
+  (e `-hml`) **e** o RG de nós auto-gerado (`MC_rg-mg-nst-core-eus-*_aks-mg-nst-core-eus-*_eastus`)
+  já estão tagueados `FINOPS-CLIENTE=COMPARTILHADO` diretamente. Isso faz a **regra 3** da hierarquia
+  de classificação (`TAG_RG_SHARED` → rateio por peso financeiro, `s02_classify.py`) disparar *antes*
+  da **regra 4** (`OVERRIDE_RG_AUTO`, padrão `MC_<rg>_<cluster>_<region>` → `ServiceKey=AKS:<cluster>`,
+  a que alimenta o rateio real por namespace via OpenCost em `s03b`) — confirmado lendo
+  `resource_to_service` de 13/09: 740 dos 761 recursos desses clusters (VMSS, discos, VMs) caem em
+  `TAG_RG_SHARED`/`COMPARTILHADO`. **Instalar OpenCost e cadastrar em `cluster_config.csv` sozinho
+  não muda esse comportamento** — é preciso também remover/alterar a tag `FINOPS-CLIENTE` desses dois
+  Resource Groups (pai e `MC_...`) para que a regra 4 tenha chance de disparar.
+- [x] `config/reference/cluster_config.csv` já tem as duas linhas adicionadas (`Tipo=shared`,
+  `OpenCostUrl` vazio) — não muda o comportamento atual sozinho (ver bloqueio acima), mas deixa o
+  cadastro pronto para quando a tag do RG for corrigida e o OpenCost instalado.
 
 ### Namespaces AKS não identificados (2026-09-14)
 Ao investigar clientes com `Custo AKS=R$0` apesar de rodarem em `aks-prd-newkmm`/`aks-hml-newkmm`,
