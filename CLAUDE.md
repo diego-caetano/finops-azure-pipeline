@@ -404,6 +404,22 @@ manifest.csv:
 ### Clusters sem OpenCost (bloquear — instalar OpenCost primeiro)
 - [ ] aks-mg-kmm-dados-eus-prd
 
+### Namespaces AKS não identificados (2026-09-14)
+Ao investigar clientes com `Custo AKS=R$0` apesar de rodarem em `aks-prd-newkmm`/`aks-hml-newkmm`,
+15 mismatches de alias (namespace com hífen/underscore diferente do `clientes_alias.csv`, ou alias
+nunca cadastrado) foram corrigidos — ver `config/reference/clientes_alias.csv` e
+`aks_system_namespaces.csv` (já enviados ao Blob). Ficaram de fora, sem mapeamento confirmado:
+- [ ] `maersktrpp`, `maersktrqa` (aks-hml-newkmm) e `braslog` (aks-hml-newkmm) — não correspondem a
+  nenhum cliente conhecido; confirmar com o time de negócio se são clientes novos não onboardados
+  (custo cai no rateio proporcional do cluster enquanto isso)
+- [ ] `apigateway`, `infra-multi-pipe-api`, `sendgrid-stats`, `terrakube` (aks-prd-newkmm) — parecem
+  infra interna, não clientes; hoje tratados como não-mapeados (efeito prático igual a
+  `aks_system_namespaces.csv`, mas sem entrar no CSV formalmente) — considerar classificar para
+  ficarem fora do `namespaces_sem_alias_{date}.csv` de auditoria
+- [ ] `ROTA_BRASIL` e `ROTABRASIL` são o mesmo cliente (confirmado) mas existem como dois `Cliente`
+  distintos em outras alocações (tag de recurso, SQL, backup) — o namespace AKS já foi mapeado para
+  `ROTABRASIL`, mas a duplicação na tag de origem no Azure ainda não foi corrigida
+
 ### Power BI
 - [ ] Reconectar `.pbix` via folder connector para `fact_allocated_cost_YYYY-MM.parquet` — ver `docs/POWER_BI.md`
 

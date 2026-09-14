@@ -21,8 +21,9 @@ ENV/
 .vscode/launch.json
 
 # Dados temporários — nunca commitar CSVs com dados reais
+# Exceção: config/reference/*.csv (arquivos de referência do pipeline, versionados de propósito)
 *.csv
-!config/reference/*.csv   # exceto os arquivos de referência
+!config/reference/*.csv
 
 # Logs
 *.log
