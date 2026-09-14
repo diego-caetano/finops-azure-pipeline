@@ -136,6 +136,62 @@ WeekdayNum  = WEEKDAY([Date], 2)
 
 ---
 
+## Tabela de ambiente (DimAmbiente)
+
+Permite filtrar/segmentar o relatório por **Ambiente** (PRD/DEV/HML) e por **Conta** (KMM/PME Services/MG Services), além do filtro por Cliente já existente — útil para responder "quanto o DEV está custando" ou "qual o total de HML de todos os clientes", coisa que hoje só dá pra ver olhando `SubscriptionId` cru.
+
+### 1. Coluna calculada em FactAllocatedCost — chave de relacionamento
+
+O FOCUS armazena `SubscriptionId` no formato ARM completo (`/subscriptions/{guid}`, ver `CLAUDE.md`), então a chave de relacionamento precisa extrair só o GUID (36 caracteres, sempre no final da string, com ou sem prefixo):
+
+```dax
+SubscriptionIdClean = LOWER(RIGHT(FactAllocatedCost[SubscriptionId], 36))
+```
+
+### 2. Tabela calculada DimAmbiente
+
+**Modelagem → Nova Tabela**:
+
+```dax
+DimAmbiente =
+DATATABLE(
+    "SubscriptionId", STRING,
+    "SubscriptionName", STRING,
+    "Conta", STRING,
+    "Ambiente", STRING,
+    {
+        {"52d4423b-7ed9-4673-b8e2-fa21cdb83176", "Azure EA - KMM - PRD", "KMM", "PRD"},
+        {"3f6d197f-f70b-4c2c-b981-8bb575d47a7a", "Azure EA - KMM - DEV-TEST", "KMM", "DEV"},
+        {"7038ef68-75ba-48fd-955a-4e67b86bca45", "nstech-pme-services-prd-sub", "PME Services", "PRD"},
+        {"66dc1f31-e830-409e-afe8-621c75ff92fc", "nstech-pme-services-dev-sub", "PME Services", "DEV"},
+        {"b9fa758a-0ccf-48a6-9033-7e92c14091e7", "nstech-pme-services-hml-sub", "PME Services", "HML"},
+        {"80d65916-3cc3-4fab-a902-c2832d851fdf", "nstech-mg-services-prd-sub", "MG Services", "PRD"},
+        {"0d606793-89c9-44a2-a1f9-a30fc650a9cd", "nstech-mg-services-dev-sub", "MG Services", "DEV"},
+        {"640f2402-d9d1-4755-a8f6-8930cbb132e8", "nstech-mg-services-hml-sub", "MG Services", "HML"}
+    }
+)
+```
+
+> `Ambiente` normaliza a subscription `DEV-TEST` da KMM para `DEV`, para casar com o rótulo usado nas outras contas — se isso confundir o time de FinOps, manter `SubscriptionName` visível na tabela de detalhe resolve a ambiguidade.
+
+### 3. Relacionamento
+
+**Modelagem → Gerenciar relacionamentos → Nova**:
+- `DimAmbiente[SubscriptionId]` (lado 1) → `FactAllocatedCost[SubscriptionIdClean]` (lado N)
+- Cardinalidade **1:N**, direção do filtro **única** (de DimAmbiente para FactAllocatedCost) — suficiente para o segmentador filtrar todas as medidas existentes sem precisar reescrever nenhum DAX.
+
+### 4. Segmentador sincronizado entre páginas
+
+Como Ambiente é um filtro que faz sentido em qualquer página (não só na 4):
+1. Inserir um **Segmentador** com o campo `DimAmbiente[Ambiente]` na Página 1 (Overview)
+2. **Exibir → Sincronização de Segmentadores**
+3. Marcar a coluna **Sincronizar** para todas as páginas onde o filtro deve valer (recomendado: Overview, Allocation Methods, AKS + Banco de Dados)
+4. Deixar **Visível** desmarcado nas páginas onde não quiser repetir o visual — o filtro continua ativo mesmo escondido
+
+Opcional: repetir o mesmo processo para `DimAmbiente[Conta]`, caso o time queira isolar KMM vs PME Services vs MG Services além do ambiente.
+
+---
+
 ## Tabela de medidas (_Medidas)
 
 Criar uma tabela separada para organizar as medidas: **Modelagem → Nova Tabela** → nomear `_Medidas`.
@@ -343,6 +399,7 @@ SUM(Manifest[Rows])
 | Ranking de clientes | Tabela | `Cliente`, `Custo AKS`, `Custo Banco de Dados`, `Custo AKS + Banco de Dados`, `% AKS + BD do Cliente` | Chargeback e priorização — quem depende mais de infra/dados compartilhados |
 | Filtro de cliente | Segmentador | `Cliente` | Isola a visão de um cliente |
 | Filtro de data | Segmentador | `Date` | Período de análise |
+| Filtro de ambiente | Segmentador (sincronizado) | `DimAmbiente[Ambiente]` | Isola PRD/DEV/HML — ver [Tabela de ambiente (DimAmbiente)](#tabela-de-ambiente-dimambiente) |
 
 **Cores sugeridas:** `Custo AKS` → `#F4400A` (laranja nstech) · `Custo Banco de Dados` → `#0D0F2B` ou um azul de apoio (ex.: `#2A78D6`) para manter contraste com o laranja na área empilhada e nas barras.
 
