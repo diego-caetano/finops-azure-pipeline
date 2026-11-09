@@ -61,6 +61,13 @@ _FACT_COST_COLUMNS = [
     "ResourceType", "SubscriptionId", "ServiceName", "Cost", "Tags",
 ]
 
+# Reserva ociosa: horas de reserva não usadas vêm no FOCUS como Usage com
+# CommitmentDiscountStatus=Unused e SEM subscription/ResourceId — o filtro de
+# subscriptions as descartaria, e o pipeline ficaria abaixo do custo amortizado do
+# portal (billing profile). Elas entram com um ResourceType sintético que o s02
+# mapeia para ServiceKey=RESERVA_OCIOSA (rateio proporcional em s05).
+UNUSED_RI_RESOURCE_TYPE = "microsoft.capacity/reservationorders/reservations"
+
 
 # ---------------------------------------------------------------------------
 # Partition helpers
@@ -138,6 +145,38 @@ def _extract_rg_from_resource_id(resource_id: str) -> str:
     """Extract resource group name from Azure Resource ID, or return empty string."""
     m = re.search(r"/resourceGroups/([^/]+)/", str(resource_id), re.IGNORECASE)
     return m.group(1) if m else ""
+
+
+def _unused_reservation_mask(df: pd.DataFrame, in_scope: pd.Series) -> pd.Series:
+    """Linhas de reserva ociosa pertencentes aos billing profiles das subscriptions do escopo.
+
+    A linha Unused não traz subscription; o vínculo com o escopo é o billing profile
+    (o mesmo que contém as subscriptions filtradas). Reservas de outros profiles
+    do mesmo export (ex.: LICENCA DE SOFTWARE) ficam de fora.
+    """
+    status_col = _resolve_column(list(df.columns), ["CommitmentDiscountStatus"], "CommitmentDiscountStatus")
+    if status_col is None:
+        return pd.Series(False, index=df.index)
+    mask = df[status_col].astype(str).str.lower().eq("unused")
+
+    profile_col = _resolve_column(list(df.columns), ["x_BillingProfileId"], "x_BillingProfileId")
+    if profile_col is not None:
+        scope_profiles = set(df.loc[in_scope, profile_col].dropna().astype(str))
+        mask &= df[profile_col].astype(str).isin(scope_profiles)
+    return mask & ~in_scope
+
+
+def _label_unused_reservations(df: pd.DataFrame, mask: pd.Series) -> None:
+    """Preenche identificadores sintéticos nas linhas de reserva ociosa (in place)."""
+    cols = list(df.columns)
+    id_col = _resolve_column(cols, ["CommitmentDiscountId"], "CommitmentDiscountId")
+    name_col = _resolve_column(cols, ["CommitmentDiscountName"], "CommitmentDiscountName")
+    ri_id = df.loc[mask, id_col].astype(str).str.lower() if id_col else "reserva-ociosa"
+    df.loc[mask, "ResourceId"] = ri_id
+    df.loc[mask, "ResourceName"] = df.loc[mask, name_col].astype(str) if name_col else ri_id
+    df.loc[mask, "ResourceGroupName"] = ""
+    df.loc[mask, "ResourceType"] = UNUSED_RI_RESOURCE_TYPE
+    df.loc[mask, "SubscriptionId"] = ""
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +264,16 @@ def run(pipeline_date: Optional[str] = None) -> None:
             .str.lower()
             .str.replace(r"^.*/subscriptions/", "", regex=True)
         )
-        df_out = df_out[sub_ids_normalized.isin(_BILLING_SUBSCRIPTION_IDS)].copy()
+        in_scope = sub_ids_normalized.isin(_BILLING_SUBSCRIPTION_IDS)
+        unused_ri = _unused_reservation_mask(df_out, in_scope)
+        if unused_ri.any():
+            _label_unused_reservations(df_out, unused_ri)
+            logger.info(
+                "📋 Reserva ociosa: %d linhas, custo=%.2f → ServiceKey RESERVA_OCIOSA",
+                int(unused_ri.sum()),
+                pd.to_numeric(df_out.loc[unused_ri, "Cost"], errors="coerce").sum(),
+            )
+        df_out = df_out[in_scope | unused_ri].copy()
         dropped = before - len(df_out)
         logger.info(
             "📋 Filtro subscriptions: %d → %d linhas (%d removidas de outras subscriptions)",

@@ -11,6 +11,9 @@ Hierarquia:
   4. OVERRIDE_RG_AUTO (Confidence=95) — RG padrão MC_* → AKS cluster
   5. RG_INFERRED     (Confidence=70) — RG sem tag → compartilhado por inferência
   6. UNKNOWN         (Confidence=0)  — sem classificação
+
+Override: reserva ociosa (linhas sintéticas do s01) → Rule=RESERVA_OCIOSA,
+ServiceKey=RESERVA_OCIOSA, rateada por peso em s05.
 """
 
 import json
@@ -22,10 +25,13 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from finops.steps.s01_ingest_focus import UNUSED_RI_RESOURCE_TYPE
 from finops.storage import pipeline_client
 from finops.utils.dates import resolve_pipeline_date, to_partition
 
 logger = logging.getLogger(__name__)
+
+UNUSED_RI_SERVICE_KEY = "RESERVA_OCIOSA"
 
 _REFERENCE_PREFIX = os.getenv("REFERENCE_PREFIX", "config/reference")
 _FACT_COST_PREFIX = os.getenv("FACT_COST_PREFIX", "silver/fact_cost")
@@ -232,6 +238,17 @@ def run(pipeline_date: Optional[str] = None) -> None:
         service_type_s = pd.Series(service_type, index=df.index)
         service_type_s[is_snapshot] = "snapshot"
         service_type = service_type_s.values
+
+    # ── Reserva ociosa override: ServiceKey=RESERVA_OCIOSA ───────────────
+    # Linhas sintéticas do s01 (sem RG/subscription) — rateio proporcional em s05
+    is_unused_ri = df["ResourceType"].fillna("").str.lower() == UNUSED_RI_RESOURCE_TYPE
+    if is_unused_ri.any():
+        service_key = service_key.where(~is_unused_ri, UNUSED_RI_SERVICE_KEY)
+        rule = np.where(is_unused_ri, "RESERVA_OCIOSA", rule)
+        service_type = np.where(is_unused_ri, "shared", service_type)
+        confidence = np.where(is_unused_ri, 100, confidence)
+        source = np.where(is_unused_ri, "commitment_discount", source)
+        effective_cliente = effective_cliente.where(~is_unused_ri, _COMPARTILHADO)
 
     # ── Monta output ───────────────────────────────────────────────────────
     df_out = pd.DataFrame({

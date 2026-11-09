@@ -162,7 +162,6 @@ def run(pipeline_date: Optional[str] = None) -> None:
                 )
                 df_agg["Prioridade"] = df_agg["WeeklyCost"].apply(_priority)
                 suggestions.append(df_agg)
-            n_action = sum(len(s) for s in suggestions if (s.get("Category") == "RECURSO_SEM_DONO").any() if hasattr(s, "get") else False)
             cost_action = float(df_action["Cost"].sum()) if "Cost" in df_action.columns else 0.0
             logger.warning(
                 "⚠ RECURSO_SEM_DONO: %d recursos não alocados | custo semanal=R$%.2f"

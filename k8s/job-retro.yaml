@@ -31,9 +31,9 @@ spec:
           command: ["python", "sh/retro_fix.py"]
           env:
             - name: RETRO_START
-              value: "2026-09-01"
+              value: "2026-07-21"
             - name: RETRO_END
-              value: "2026-09-13"
+              value: "2026-10-14"
           envFrom:
             - configMapRef:
                 name: finops-pipeline-config

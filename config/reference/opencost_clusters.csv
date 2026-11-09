@@ -4,3 +4,5 @@ AKS:aks-prd-br-newkmm;aks-prd-br-newkmm;http://10.151.24.6:9003
 AKS:aks-mg-kmm-firewall-eus-prd;aks-mg-kmm-firewall-eus-prd;http://10.152.51.4:9003 
 AKS:aks-mg-kmm-firewall-eus-hml;aks-mg-kmm-firewall-eus-hml;http://10.153.6.6:9003
 AKS:aks-hml-newkmm;aks-hml-newkmm;http://10.152.12.117:9003
+AKS:aks-mg-nst-core-eus-prd;aks-mg-nst-core-eus-prd;http://10.142.0.32:9003
+AKS:aks-mg-nst-core-eus-hml;aks-mg-nst-core-eus-hml;http://10.12.0.24:9003

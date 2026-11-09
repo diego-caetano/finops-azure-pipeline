@@ -2,7 +2,7 @@
 """Retrocarga corretiva — reprocessa datas com FOCUS billing lag.
 
 Uso:
-  python sh/retro_fix.py                           # últimos 7 dias (padrão CronJob)
+  python sh/retro_fix.py                           # 7 dias terminando em D-3 (padrão CronJob)
   python sh/retro_fix.py --start 2026-05-15 --end 2026-05-20
 
 Pode ser executado:
@@ -119,9 +119,15 @@ def parse_args() -> tuple[str, str]:
     if start and end:
         return start, end
 
+    # Janela [D-(LAG+6), D-LAG]: 7 dias contíguos entre execuções semanais, sem nunca
+    # gravar um dia ainda aberto pelo billing lag. Antes era [D-7, D-1] e a execução de
+    # segunda gravava D-1/D-2 parciais no consolidado (ex.: 08/11/2026 entrou com R$5,3k
+    # em vez de ~R$11,5k; mesma causa da divergência de 57% em 23/08/2026).
+    from finops.utils.dates import FOCUS_LAG_DAYS
+
     today = datetime.now(BRT)
-    end   = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-    start = (today - timedelta(days=DEFAULT_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    end   = (today - timedelta(days=FOCUS_LAG_DAYS)).strftime("%Y-%m-%d")
+    start = (today - timedelta(days=FOCUS_LAG_DAYS + DEFAULT_LOOKBACK_DAYS - 1)).strftime("%Y-%m-%d")
     return start, end
 
 

@@ -284,6 +284,11 @@ def run(pipeline_date: Optional[str] = None) -> None:
 
     if unmapped_ns:
         df_unmapped = pd.DataFrame(unmapped_ns)
-        blob_unmapped = f"{_AKS_OUT_PREFIX}/{to_partition(date_str)}/namespaces_sem_alias_{date_str}.csv"
+        # Nome inclui o cluster: todos os s03b gravam na mesma partição e um nome único
+        # por data fazia cada cluster sobrescrever a auditoria do anterior (s08 via só o último).
+        blob_unmapped = (
+            f"{_AKS_OUT_PREFIX}/{to_partition(date_str)}/"
+            f"namespaces_sem_alias_{cluster_name}_{date_str}.csv"
+        )
         store.write_csv(blob_unmapped, df_unmapped)
         logger.info("📋 Namespaces sem alias: %d → %s", len(df_unmapped), blob_unmapped)

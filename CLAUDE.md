@@ -242,7 +242,7 @@ Override pós-hierarquia:
 | Step | Arquivo | Descrição |
 |---|---|---|
 | s00 | `finops/steps/s00_sync_rg_tags.py` | Varre RGs, salva rg_tags.csv |
-| s01 | `finops/steps/s01_ingest_focus.py` | Lê FOCUS parquet → fact_cost; usa `EffectiveCost` (não BilledCost) |
+| s01 | `finops/steps/s01_ingest_focus.py` | Lê FOCUS parquet → fact_cost; usa `EffectiveCost` (não BilledCost); inclui reserva ociosa (`CommitmentDiscountStatus=Unused`, sem subscription) do mesmo billing profile das subscriptions do escopo |
 | s02 | `finops/steps/s02_classify.py` | Classifica recursos → resource_to_service |
 | s03a | `finops/steps/s03a_dedicated.py` | Recursos dedicados, share=1.0 |
 | s03b | `finops/steps/s03b_aks.py` | AKS via OpenCost; DEFAULT/COMPARTILHADO redistribuídos; fallback para shares históricos (`AKS_OPENCOST_CACHED`) se OpenCost indisponível |
@@ -350,10 +350,18 @@ fact_allocated_cost (diário e consolidado mensal — mesmo schema):
     AKS_OPENCOST           → nome do node/VM de billing (namespace está no ServiceKey)
     AKS_OPENCOST_CACHED    → mesmo que AKS_OPENCOST, mas OpenCost estava indisponível; shares do dia anterior reutilizados
     WEIGHT_PROPORTIONAL    → recurso compartilhado (aparece N vezes, 1 por cliente)
+    RESERVA_OCIOSA         → nome da reserva (CommitmentDiscountName); horas de reserva não usadas,
+                             ServiceKey=RESERVA_OCIOSA, SubscriptionId vazio, rateadas por peso (s04)
 
 manifest.csv:
   Date;Status;Rows;TotalAllocated;TotalCost;ProcessedAt;PipelineRun
 ```
+
+**Total vs portal Azure:** desde 2026-10-17 (retro 21/07→14/10) o total do pipeline = custo
+**amortizado** do billing profile "KMM - GASTOS COM NUVEM" no portal (inclui reserva ociosa).
+O *actual cost* do portal difere em centenas de R$/mês porque lança a parcela mensal da reserva
+(compra) no lugar das horas amortizadas — não é divergência. Todas as reservas têm escopo Single
+na sub KMM PRD (21 de 23) — risco de ociosidade total se a sub for deletada sem re-scope.
 
 **Atenção — Power BI:** usar sempre `SUM(AllocatedCost)`, nunca `SUM(Cost)`. O campo `Cost` é repetido por cliente no fan-out do s06 e fica inflado.
 

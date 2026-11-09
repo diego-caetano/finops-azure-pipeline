@@ -14,8 +14,10 @@ import logging
 import os
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
+from finops.steps.s02_classify import UNUSED_RI_SERVICE_KEY
 from finops.storage import pipeline_client
 from finops.utils.dates import resolve_pipeline_date, to_partition
 
@@ -158,7 +160,11 @@ def run(pipeline_date: Optional[str] = None) -> None:
         )
         cross["Date"] = date_str
         cross["DriverType"] = "CLIENT_WEIGHT"
-        cross["AllocationMethod"] = "WEIGHT_PROPORTIONAL"
+        # Reserva ociosa usa o mesmo rateio, mas com método próprio para ficar
+        # identificável no Power BI e fora das sugestões PESO_PROPORCIONAL do s09
+        cross["AllocationMethod"] = np.where(
+            cross["ServiceKey"] == UNUSED_RI_SERVICE_KEY, "RESERVA_OCIOSA", "WEIGHT_PROPORTIONAL"
+        )
         frames_out.append(cross[_OUTPUT_COLUMNS])
 
     if not frames_out:

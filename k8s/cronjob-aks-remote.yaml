@@ -1,0 +1,105 @@
+# CronJobs AKS "remotos" — rodam no cluster central (aks-prd-newkmm) e consultam o OpenCost
+# de outro cluster pelo IP do LoadBalancer interno (via peering de VNet).
+#
+# Por que remoto: os clusters aks-mg-nst-core-eus-* têm OpenCost instalado, mas não têm
+# Workload Identity habilitado nem namespace finops. Rodar daqui reaproveita a identity do
+# cluster central (Storage Blob Data Contributor em finops-v2) e evita `az aks update` em PRD.
+# Conectividade validada em 2026-11-09 (curl /healthz → 200 a partir de um pod em finops).
+#
+# Aplicar SOMENTE no cluster central:
+#   kubectl --context aks-prd-newkmm apply -f k8s/cronjob-aks-remote.yaml
+#
+# Usa o ConfigMap finops-aks-config já existente no cluster central; CLUSTER_NAME e
+# OPENCOST_ENDPOINT são sobrescritos por env (env tem precedência sobre envFrom).
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: finops-aks-remote-mg-nst-core-prd
+  namespace: finops
+spec:
+  schedule: "15 5 * * *"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            azure.workload.identity/use: "true"
+            app: finops-aks-remote
+        spec:
+          serviceAccountName: finops-workload-identity-sa
+          restartPolicy: Never
+          containers:
+            - name: finops-aks
+              image: registrykmm.azurecr.io/finops-pipeline:latest
+              imagePullPolicy: Always
+              command: ["python", "-m", "jobs.run_aks"]
+              envFrom:
+                - configMapRef:
+                    name: finops-aks-config
+              env:
+                - name: CLUSTER_NAME
+                  value: "aks-mg-nst-core-eus-prd"
+                - name: OPENCOST_ENDPOINT
+                  value: "http://10.142.0.32:9003"
+                - name: OPENCOST_TIMEOUT_SEC
+                  value: "180"
+              resources:
+                requests: {cpu: "100m", memory: "256Mi"}
+                limits: {cpu: "500m", memory: "512Mi"}
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: 1000
+                capabilities: {drop: ["ALL"]}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: finops-aks-remote-mg-nst-core-hml
+  namespace: finops
+spec:
+  schedule: "20 5 * * *"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            azure.workload.identity/use: "true"
+            app: finops-aks-remote
+        spec:
+          serviceAccountName: finops-workload-identity-sa
+          restartPolicy: Never
+          containers:
+            - name: finops-aks
+              image: registrykmm.azurecr.io/finops-pipeline:latest
+              imagePullPolicy: Always
+              command: ["python", "-m", "jobs.run_aks"]
+              envFrom:
+                - configMapRef:
+                    name: finops-aks-config
+              env:
+                - name: CLUSTER_NAME
+                  value: "aks-mg-nst-core-eus-hml"
+                - name: OPENCOST_ENDPOINT
+                  value: "http://10.12.0.24:9003"
+                - name: OPENCOST_TIMEOUT_SEC
+                  value: "180"
+              resources:
+                requests: {cpu: "100m", memory: "256Mi"}
+                limits: {cpu: "500m", memory: "512Mi"}
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                runAsUser: 1000
+                capabilities: {drop: ["ALL"]}

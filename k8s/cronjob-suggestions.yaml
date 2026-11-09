@@ -35,7 +35,7 @@ spec:
             - name: finops-pipeline
               image: registrykmm.azurecr.io/finops-pipeline:latest
               imagePullPolicy: Always
-              command: ["python", "jobs/run_suggestions.py"]
+              command: ["python", "-m", "jobs.run_suggestions"]
               envFrom:
                 - configMapRef:
                     name: finops-pipeline-config
