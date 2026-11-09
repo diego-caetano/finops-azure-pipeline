@@ -221,8 +221,8 @@ Override pós-hierarquia:
 | aks-mg-kmm-firewall-eus-prd | RG-US-PRD-KMM | ✅ http://10.152.51.4:9003 |
 | aks-mg-kmm-firewall-eus-hml | RG-DEV-KMM (sub: 3f6d197f — usar `--subscription 3f6d197f-f70b-4c2c-b981-8bb575d47a7a`) | ✅ http://10.153.6.6:9003 |
 | aks-mg-kmm-dados-eus-prd | rg-mg-kmm-dados-eus-prd (sub: 52d4423b) | ❌ pendente instalação |
-| aks-mg-nst-core-eus-prd | rg-mg-nst-core-eus-prd (sub: 80d65916 — MG Services PRD) | ❌ pendente instalação — ver nota de migração abaixo |
-| aks-mg-nst-core-eus-hml | rg-mg-nst-core-eus-hml (sub: 640f2402 — MG Services HML) | ❌ pendente instalação — ver nota de migração abaixo |
+| aks-mg-nst-core-eus-prd | rg-mg-nst-core-eus-prd (sub: 80d65916 — MG Services PRD) | ✅ http://10.142.0.32:9003 — s03b **remoto**, roda no cluster central (`k8s/cronjob-aks-remote.yaml`, 05:15 UTC) |
+| aks-mg-nst-core-eus-hml | rg-mg-nst-core-eus-hml (sub: 640f2402 — MG Services HML) | ✅ http://10.12.0.24:9003 — s03b **remoto**, roda no cluster central (05:20 UTC); pod OpenCost com muitos restarts (39 em 9d, exit 1) |
 | aks-mg-kmm-nocst-eus-*-01 | (confirmar) | ❌ dedicated NORCOAST — não necessário |
 
 > `aks-prd-emissor` e `aks-mg-kmm-win-eus-hml` foram removidos do tenant (confirmado via Resource Graph em 2026-09-11) — não existem mais como clusters a migrar/instalar OpenCost.
@@ -234,8 +234,9 @@ Override pós-hierarquia:
 ```
 04:00 UTC           → s00_sync_rg_tags   (varre RGs → rg_tags.csv)
 05:00 UTC           → s03b_aks           (dentro de cada cluster compartilhado)
+05:15/05:20 UTC     → s03b remoto MG core (no cluster central, via IP interno do OpenCost)
 06:00 UTC           → pipeline principal (s01→s02→s03a→s03c→s03d→s04→s05→s06→s07→s08) — D-3 BRT
-07:00 UTC (2ª-feira)→ finops-retro-fix   (reprocessa últimos 7 dias com FOCUS atualizado)
+07:00 UTC (2ª-feira)→ finops-retro-fix   (reprocessa 7 dias [D-9, D-3] com FOCUS atualizado — até 2026-11-09 era [D-7, D-1] e gravava dias abertos)
 09:00 UTC (2ª-feira)→ finops-suggestions (s09 — sugestões de redução de custo, após retro-fix)
 ```
 
@@ -437,9 +438,12 @@ decisão de quando/se os clusters KMM (`aks-prd-newkmm`, `aks-hml-newkmm` etc.) 
     provável destino direto da migração desse cluster
   - ⚠ namespace `marechak` (14 dias, `aks-mg-nst-core-eus-hml`) parece typo de `marechal` — confirmar
     com quem criou antes de decidir se precisa de alias próprio
-- [ ] **OpenCost NÃO está instalado em nenhum dos dois** (confirmado: sem namespace `opencost`, sem
-  pods/serviços com esse label) — pré-requisito obrigatório antes de qualquer outra coisa, ver
-  runbook em `docs/MANUTENCAO.md#adicionar-um-novo-cluster-aks-compartilhado`.
+- [x] **Rateio por namespace ativo desde 2026-11-09.** OpenCost já estava instalado nos dois (LB
+  interno, 53 dias), mas sem namespace `finops` nem Workload Identity. Em vez de `az aks update`, o
+  s03b roda no cluster central (`k8s/cronjob-aks-remote.yaml`) consultando `10.142.0.32` / `10.12.0.24`
+  com a identity do aks-prd-newkmm. 11 aliases MG adicionados (HSMOVERE, RAPIDO_FIGUEIREDO, RODONERY,
+  GAMPER, HOK, DCAN, UNIAOMULTIMODAL, SIMARELLI, MRS, DUMAR, ALICON) → cobertura 99% PRD / 89% HML.
+  Resta sem alias: namespace `swat` (HML, dono desconhecido).
 - [x] `config/reference/cluster_config.csv` já tem as duas linhas adicionadas (`Tipo=shared`,
   `OpenCostUrl` vazio, já no Blob desde 2026-09-14) — isso já é suficiente para o `s02_classify.py`
   reconhecer o padrão `MC_rg-mg-nst-core-eus-*_aks-mg-nst-core-eus-*_eastus` e gerar
@@ -447,9 +451,7 @@ decisão de quando/se os clusters KMM (`aks-prd-newkmm`, `aks-hml-newkmm` etc.) 
   estando tagueados `FINOPS-CLIENTE=COMPARTILHADO`** — o código já trata isso de propósito
   (`s02_classify.py` linha ~189, `rule4_wins`, comentário "OVERRIDE_RG_AUTO tem prioridade sobre
   TAG_RG_SHARED ... ignorar tag COMPARTILHADO do rg_tags.csv"). A tag COMPARTILHADO no RG **não
-  precisa mudar** — confirmado simulando `_mc_cluster_vec` com a lista de clusters atualizada. Só
-  falta instalar o OpenCost + CronJob/Managed Identity; depois disso o rateio real por namespace via
-  `aks_system_namespaces.csv`/`clientes_alias.csv` (mesmo mecanismo dos outros clusters) já funciona.
+  precisa mudar** — confirmado simulando `_mc_cluster_vec` com a lista de clusters atualizada.
 
 ### Namespaces AKS não identificados (2026-09-14)
 Ao investigar clientes com `Custo AKS=R$0` apesar de rodarem em `aks-prd-newkmm`/`aks-hml-newkmm`,
