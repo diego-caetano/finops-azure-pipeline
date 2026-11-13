@@ -1,0 +1,32 @@
+# RBAC para leitura de namespace labels pelo s03b_aks.py (in-cluster).
+#
+# Aplicar em TODOS os clusters locais onde o s03b roda in-cluster:
+#   aks-prd-newkmm, aks-prd-br-newkmm, aks-hml-newkmm,
+#   aks-mg-kmm-firewall-eus-prd, aks-mg-kmm-firewall-eus-hml
+#
+# NÃO aplicar nos clusters remotos (aks-mg-nst-core-eus-*) — esses usam
+# run_command a partir do cluster central, sem pod local.
+#
+#   kubectl --context <cluster> apply -f k8s/rbac-finops-aks.yaml
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: finops-namespace-reader
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: finops-namespace-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: finops-namespace-reader
+subjects:
+  - kind: ServiceAccount
+    name: finops-workload-identity-sa
+    namespace: finops

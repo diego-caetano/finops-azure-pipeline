@@ -3,10 +3,19 @@ s03b_aks.py — Alocação AKS por namespace via OpenCost.
 
 Roda dentro de cada cluster compartilhado (05:00 UTC).
 Lê CLUSTER_NAME e OPENCOST_ENDPOINT do ambiente, chama a API de alocação
-por namespace, redistribui o custo de namespaces de sistema, mapeia
-namespace → cliente via clientes_alias.csv e grava os shares no storage.
+por namespace, redistribui o custo de namespaces de sistema, resolve
+namespace → cliente via label K8s `finops-cliente` (primário) ou
+clientes_alias.csv (fallback) e grava os shares no storage.
+
+Resolução de namespace → cliente:
+  1. Label `finops-cliente` do namespace (K8s API)
+     - Clusters locais: kubernetes Python client (in-cluster)
+     - Clusters remotos: ContainerService run_command (env REMOTE_AKS_RG/SUBSCRIPTION)
+  2. clientes_alias.csv (fallback para namespaces sem label)
+  3. Bucket de sistema (redistribuído proporcionalmente aos mapeados)
 """
 
+import json
 import logging
 import os
 import re
@@ -20,6 +29,8 @@ from finops.storage import pipeline_client
 from finops.utils.dates import resolve_pipeline_date, to_partition
 
 logger = logging.getLogger(__name__)
+
+_LABEL_KEY = "finops-cliente"
 
 _REFERENCE_PREFIX = os.getenv("REFERENCE_PREFIX", "config/reference")
 _AKS_OUT_PREFIX = os.getenv("AKS_OUT_PREFIX", "gold/aks_allocation_share_opencost")
@@ -97,6 +108,81 @@ def _load_last_known_shares(
 
 
 # ------------------------------------------------------------------
+# K8s namespace label resolution
+# ------------------------------------------------------------------
+
+def _fetch_labels_incluster() -> dict[str, str]:
+    """Busca labels via kubernetes Python client (in-cluster config)."""
+    try:
+        from kubernetes import client as k8s_client, config as k8s_config
+        k8s_config.load_incluster_config()
+        v1 = k8s_client.CoreV1Api()
+        ns_list = v1.list_namespace()
+        result = {}
+        for ns in ns_list.items:
+            labels = ns.metadata.labels or {}
+            cliente = labels.get(_LABEL_KEY)
+            if cliente:
+                result[ns.metadata.name] = cliente
+        logger.info("🏷️  Labels in-cluster: %d namespaces com %s", len(result), _LABEL_KEY)
+        return result
+    except Exception as exc:
+        logger.warning("⚠ Falha ao ler labels K8s in-cluster: %s — usando somente CSV", exc)
+        return {}
+
+
+def _fetch_labels_remote(cluster_name: str, resource_group: str, subscription_id: str) -> dict[str, str]:
+    """Busca labels via ContainerService run_command (clusters remotos sem Workload Identity local)."""
+    try:
+        from azure.mgmt.containerservice import ContainerServiceClient
+        from azure.mgmt.containerservice.models import RunCommandRequest
+        from azure.identity import DefaultAzureCredential
+
+        cred = DefaultAzureCredential()
+        cs_client = ContainerServiceClient(cred, subscription_id)
+        poller = cs_client.managed_clusters.begin_run_command(
+            resource_group_name=resource_group,
+            resource_name=cluster_name,
+            request_parameters=RunCommandRequest(command="kubectl get ns -o json"),
+        )
+        result = poller.result(timeout=120)
+        if result.exit_code != 0:
+            raise RuntimeError(f"kubectl exit {result.exit_code}: {(result.logs or '')[:300]}")
+
+        ns_data = json.loads(result.logs or "{}")
+        label_map = {}
+        for ns in ns_data.get("items", []):
+            labels = (ns.get("metadata") or {}).get("labels") or {}
+            cliente = labels.get(_LABEL_KEY)
+            if cliente:
+                label_map[ns["metadata"]["name"]] = cliente
+
+        logger.info("🏷️  Labels remote run_command: %d namespaces com %s", len(label_map), _LABEL_KEY)
+        return label_map
+    except Exception as exc:
+        logger.warning("⚠ Falha ao buscar labels via run_command em %s: %s — usando somente CSV", cluster_name, exc)
+        return {}
+
+
+def _fetch_namespace_labels(cluster_name: str) -> dict[str, str]:
+    """
+    Retorna {namespace: finops-cliente} detectando o modo automaticamente:
+      REMOTE_AKS_RG definido  → ContainerService run_command (cluster remoto)
+      KUBERNETES_SERVICE_HOST → kubernetes Python client (in-cluster)
+      Nenhum dos dois         → dict vazio (somente CSV)
+    """
+    remote_rg  = os.getenv("REMOTE_AKS_RG", "").strip()
+    remote_sub = os.getenv("REMOTE_AKS_SUBSCRIPTION", "").strip()
+
+    if remote_rg and remote_sub:
+        return _fetch_labels_remote(cluster_name, remote_rg, remote_sub)
+    if os.getenv("KUBERNETES_SERVICE_HOST"):
+        return _fetch_labels_incluster()
+    logger.warning("⚠ Sem acesso à API K8s — resolução de namespace via CSV apenas")
+    return {}
+
+
+# ------------------------------------------------------------------
 # Namespace classification helpers
 # ------------------------------------------------------------------
 
@@ -130,14 +216,12 @@ def _is_system_candidate(ns: str) -> bool:
     return any(p in ns_lower for p in _SYSTEM_CANDIDATE_PATTERNS)
 
 
-def _resolve_client(ns: str, alias_df: pd.DataFrame) -> Optional[str]:
-    """Return cliente name by matching namespace against alias table, or None."""
+def _resolve_client_csv(ns: str, alias_df: pd.DataFrame) -> Optional[str]:
+    """Fallback: resolve namespace → cliente via clientes_alias.csv."""
     ns_lower = ns.lower()
-    # exact match first
     exact = alias_df[alias_df["Alias"].str.lower() == ns_lower]
     if not exact.empty:
         return str(exact.iloc[0]["Cliente"])
-    # substring: alias contained in namespace name
     for _, row in alias_df.iterrows():
         if str(row["Alias"]).lower() in ns_lower:
             return str(row["Cliente"])
@@ -160,8 +244,8 @@ def run(pipeline_date: Optional[str] = None) -> None:
     alias_df = store.read_csv(f"{_REFERENCE_PREFIX}/clientes_alias.csv")
     system_df = store.read_csv(f"{_REFERENCE_PREFIX}/aks_system_namespaces.csv")
 
-    # ServiceKey é construído a partir de CLUSTER_NAME; não precisa ler cluster_config.csv
-    # (cluster_config.csv é referência estática usada por outros steps)
+    # Fetch namespace labels (resolução primária: label > CSV)
+    ns_labels = _fetch_namespace_labels(cluster_name)
 
     try:
         ns_costs = _fetch_allocations(endpoint, date_str)
@@ -214,15 +298,31 @@ def run(pipeline_date: Optional[str] = None) -> None:
         logger.warning("⚠ Custo de negócio = 0 para %s — abortando", cluster_name)
         return
 
-    # Map namespace → client; redistribute unmapped (incl. DEFAULT) to system bucket
+    # Map namespace → client: label (primário) → CSV (fallback)
     client_costs: dict[str, float] = {}
     unmapped_cost = 0.0
     unmapped_ns: list[dict] = []
+    n_by_label = 0
+    n_by_csv = 0
 
     for ns, cost in business.items():
-        cliente = _resolve_client(ns, alias_df)
-        if cliente and cliente.upper() not in ("COMPARTILHADO", "DEFAULT"):
+        # Prioridade 1: label K8s
+        cliente = ns_labels.get(ns)
+        source = "LABEL"
+        if cliente and cliente.upper() in ("COMPARTILHADO", "DEFAULT"):
+            cliente = None
+
+        # Prioridade 2: CSV alias
+        if not cliente:
+            cliente = _resolve_client_csv(ns, alias_df)
+            source = "CSV"
+
+        if cliente:
             client_costs[cliente] = client_costs.get(cliente, 0.0) + cost
+            if source == "LABEL":
+                n_by_label += 1
+            else:
+                n_by_csv += 1
         else:
             logger.debug("Namespace sem mapeamento: %s (custo=%.6f) → sistema", ns, cost)
             unmapped_cost += cost
@@ -230,10 +330,14 @@ def run(pipeline_date: Optional[str] = None) -> None:
                 "Cluster": cluster_name,
                 "Namespace": ns,
                 "UnmappedCost": round(cost, 6),
-                "AliasResolvido": cliente or "",
+                "LabelResolucao": ns_labels.get(ns, ""),
+                "CsvResolucao": "",
                 "RedistribuidoPara": "system_bucket",
                 "CandidatoSistema": _is_system_candidate(ns),
             })
+
+    logger.info("🏷️  Resolvidos por label: %d | por CSV: %d | sem mapeamento: %d",
+                n_by_label, n_by_csv, len(unmapped_ns))
 
     # Accumulate all system cost (infra + unmapped)
     total_system = system_cost + unmapped_cost

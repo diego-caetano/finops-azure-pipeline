@@ -49,6 +49,10 @@ spec:
                   value: "http://10.142.0.32:9003"
                 - name: OPENCOST_TIMEOUT_SEC
                   value: "180"
+                - name: REMOTE_AKS_RG
+                  value: "rg-mg-nst-core-eus-prd"
+                - name: REMOTE_AKS_SUBSCRIPTION
+                  value: "80d65916-3cc3-4fab-a902-c2832d851fdf"
               resources:
                 requests: {cpu: "100m", memory: "256Mi"}
                 limits: {cpu: "500m", memory: "512Mi"}
@@ -95,6 +99,10 @@ spec:
                   value: "http://10.12.0.24:9003"
                 - name: OPENCOST_TIMEOUT_SEC
                   value: "180"
+                - name: REMOTE_AKS_RG
+                  value: "rg-mg-nst-core-eus-hml"
+                - name: REMOTE_AKS_SUBSCRIPTION
+                  value: "640f2402-d9d1-4755-a8f6-8930cbb132e8"
               resources:
                 requests: {cpu: "100m", memory: "256Mi"}
                 limits: {cpu: "500m", memory: "512Mi"}
